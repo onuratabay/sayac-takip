@@ -2,7 +2,7 @@ create table public.apartments (
   id uuid primary key default gen_random_uuid(),
   owner_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
   unit_number text not null check (length(trim(unit_number)) > 0),
-  apartment_type text not null check (apartment_type in ('1+0', '1+1', '1+2', '1+3')),
+  apartment_type text not null check (apartment_type in ('1+0', '1+1', '2+1', '3+1')),
   created_at timestamptz not null default now(),
   unique (owner_id, unit_number),
   unique (id, owner_id)
@@ -11,7 +11,7 @@ create table public.apartments (
 create table public.monthly_rates (
   owner_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
   rate_month date not null check (extract(day from rate_month) = 1),
-  apartment_type text not null check (apartment_type in ('1+0', '1+1', '1+2', '1+3')),
+  apartment_type text not null check (apartment_type in ('1+0', '1+1', '2+1', '3+1')),
   dues numeric(12, 2) not null default 0 check (dues >= 0),
   hot_water_price numeric(12, 2) not null default 0 check (hot_water_price >= 0),
   created_at timestamptz not null default now(),

@@ -4,7 +4,7 @@ import type { Session } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 import './App.css'
 
-const apartmentTypes = ['1+0', '1+1', '1+2', '1+3'] as const
+const apartmentTypes = ['1+0', '1+1', '2+1', '3+1'] as const
 type ApartmentType = (typeof apartmentTypes)[number]
 
 interface Apartment {
@@ -30,11 +30,32 @@ interface ReadingDraft {
   current: string
 }
 
+interface SharedDue {
+  apartment_number: string | null
+  monthly_due: number | null
+  share_month: string
+}
+
+type AppRole = 'manager' | 'accountant' | 'concierge'
+
+interface Access {
+  owner_id: string
+  role: AppRole
+}
+
+interface ManagedUser {
+  user_id: string
+  email: string
+  role: AppRole | null
+  last_sign_in_at: string | null
+  created_at: string
+}
+
 const emptyRates = (): Record<ApartmentType, { dues: string; hotWater: string }> => ({
   '1+0': { dues: '0', hotWater: '0' },
   '1+1': { dues: '0', hotWater: '0' },
-  '1+2': { dues: '0', hotWater: '0' },
-  '1+3': { dues: '0', hotWater: '0' },
+  '2+1': { dues: '0', hotWater: '0' },
+  '3+1': { dues: '0', hotWater: '0' },
 })
 
 function currentMonth() {
@@ -65,12 +86,37 @@ function formatMoney(value: number) {
   }).format(value)
 }
 
+function formatTimestamp(value: string | null) {
+  if (!value) return 'Henüz giriş yapmadı'
+  return new Intl.DateTimeFormat('tr-TR', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+  }).format(new Date(value))
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Beklenmeyen bir hata oluştu.'
 }
 
+function roleLabel(role: AppRole) {
+  if (role === 'manager') return 'Yönetici'
+  if (role === 'accountant') return 'Muhasebeci'
+  return 'Apartman görevlisi'
+}
+
 function App() {
+  const [shareId] = useState(() => new URLSearchParams(window.location.search).get('share'))
+  const [sharedDues, setSharedDues] = useState<SharedDue[]>([])
+  const [sharedMonth, setSharedMonth] = useState('')
+  const [shareLoading, setShareLoading] = useState(Boolean(shareId))
+  const [shareError, setShareError] = useState('')
   const [session, setSession] = useState<Session | null>(null)
+  const [access, setAccess] = useState<Access | null>(null)
+  const [accessLoading, setAccessLoading] = useState(false)
+  const [managedUsers, setManagedUsers] = useState<ManagedUser[]>([])
+  const [userSearch, setUserSearch] = useState('')
+  const [usersLoading, setUsersLoading] = useState(false)
+  const [updatingUserId, setUpdatingUserId] = useState('')
   const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
   const [isSignup, setIsSignup] = useState(false)
   const [email, setEmail] = useState('')
@@ -80,17 +126,20 @@ function App() {
   const [month, setMonth] = useState(currentMonth)
   const [apartments, setApartments] = useState<Apartment[]>([])
   const [rates, setRates] = useState(emptyRates)
-  const [readingDrafts, setReadingDrafts] = useState<Record<string, ReadingDraft>>({})
+  const [bulkReadings, setBulkReadings] = useState<Record<number, ReadingDraft>>({})
   const [previousReadings, setPreviousReadings] = useState<Record<string, number>>({})
   const [currentReadings, setCurrentReadings] = useState<Record<string, number>>({})
-  const [loading, setLoading] = useState(true)
   const [savingRates, setSavingRates] = useState(false)
   const [savingApartment, setSavingApartment] = useState(false)
-  const [savingReadings, setSavingReadings] = useState<Record<string, boolean>>({})
+  const [savingBulkApartments, setSavingBulkApartments] = useState(false)
+  const [savingShare, setSavingShare] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [unitNumber, setUnitNumber] = useState('')
   const [apartmentType, setApartmentType] = useState<ApartmentType>('1+1')
+  const [bulkTypes, setBulkTypes] = useState<Record<number, ApartmentType | ''>>(
+    () => Object.fromEntries(Array.from({ length: 46 }, (_, index) => [index + 1, ''])),
+  )
   const dataRequestId = useRef(0)
 
   useEffect(() => {
@@ -103,10 +152,14 @@ function App() {
       if (!active) return
       if (sessionError) setError(sessionError.message)
       setSession(data.session)
+      setAccessLoading(Boolean(data.session))
       setAuthReady(true)
     })
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession)
+      setAccess(null)
+      setAccessLoading(Boolean(nextSession))
+      setManagedUsers([])
       setAuthReady(true)
       setAuthMessage('')
     })
@@ -117,8 +170,111 @@ function App() {
     }
   }, [])
 
-  const loadData = useCallback(async () => {
+  useEffect(() => {
     if (!supabase || !session) return
+
+    let active = true
+    Promise.resolve(supabase.rpc('get_my_access')).then(({ data, error: accessError }) => {
+      if (!active) return
+      if (accessError) {
+        setError(`Rol bilgisi alınamadı: ${accessError.message}`)
+      } else {
+        const result = data as Access[] | null
+        setAccess(result?.[0] ?? null)
+        if (!result?.[0]) setError('Bu hesap için bina erişim rolü tanımlanmamış.')
+      }
+      setAccessLoading(false)
+    }).catch((accessError: unknown) => {
+      if (!active) return
+      setError(`Rol bilgisi alınamadı: ${errorMessage(accessError)}`)
+      setAccessLoading(false)
+    })
+
+    return () => {
+      active = false
+    }
+  }, [session])
+
+  const isManager = access?.role === 'manager'
+  const isConcierge = access?.role === 'concierge'
+
+  const loadManagedUsers = useCallback(async () => {
+    if (!supabase || !isManager) return
+    setUsersLoading(true)
+    try {
+      const { data, error: usersError } = await supabase.rpc('list_registered_users')
+      if (usersError) throw usersError
+      setManagedUsers(data as ManagedUser[])
+    } catch (usersError) {
+      setError(`Kullanıcı listesi alınamadı: ${errorMessage(usersError)}`)
+    } finally {
+      setUsersLoading(false)
+    }
+  }, [isManager])
+
+  useEffect(() => {
+    // Manager role changes trigger loading the authorized user directory.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadManagedUsers()
+  }, [loadManagedUsers])
+
+  async function changeUserRole(user: ManagedUser, role: Exclude<AppRole, 'manager'> | null) {
+    if (!supabase || !isManager || user.role === 'manager') return
+    setUpdatingUserId(user.user_id)
+    setError('')
+    setNotice('')
+    try {
+      if (role) {
+        const { error: roleError } = await supabase.rpc('add_building_member', {
+          p_email: user.email,
+          p_role: role,
+        })
+        if (roleError) throw roleError
+        setNotice(`${user.email} rolü ${roleLabel(role)} olarak güncellendi.`)
+      } else {
+        const { error: removeError } = await supabase.rpc('remove_building_member', {
+          p_user_id: user.user_id,
+        })
+        if (removeError) throw removeError
+        setNotice(`${user.email} rolü kaldırıldı.`)
+      }
+      await loadManagedUsers()
+    } catch (roleError) {
+      setError(`Kullanıcı rolü güncellenemedi: ${errorMessage(roleError)}`)
+    } finally {
+      setUpdatingUserId('')
+    }
+  }
+
+  useEffect(() => {
+    if (!shareId || !supabase) return
+    let active = true
+    Promise.resolve(supabase.rpc('get_shared_dues', { p_share_id: shareId }))
+      .then(({ data, error: loadError }) => {
+        if (!active) return
+        if (loadError) {
+          setShareError(loadError.message)
+        } else if (!data || data.length === 0) {
+          setShareError('Bu paylaşım bulunamadı veya artık erişilebilir değil.')
+        } else {
+          const rows = data as SharedDue[]
+          setSharedDues(rows.filter((row) => row.apartment_number !== null))
+          setSharedMonth(rows[0].share_month.slice(0, 7))
+        }
+        setShareLoading(false)
+      })
+      .catch((loadError: unknown) => {
+        if (!active) return
+        setShareError(`Paylaşım yüklenemedi: ${errorMessage(loadError)}`)
+        setShareLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [shareId])
+
+  const loadData = useCallback(async () => {
+    if (!supabase || !session || !access) return
     const requestId = ++dataRequestId.current
     try {
       const previousMonth = shiftMonth(month, -1)
@@ -159,26 +315,31 @@ function App() {
         }
       }
 
+      const readingsByApartment = new Map<string, ReadingDraft>()
+      for (const apartment of nextApartments) {
+        const previousIndex = previous[apartment.id]
+        const currentIndex = current[apartment.id]
+        readingsByApartment.set(apartment.unit_number, {
+          previous: previousIndex === undefined ? '' : String(previousIndex),
+          current: currentIndex === undefined ? '' : String(currentIndex),
+        })
+      }
+
       setApartments(nextApartments)
       setRates(nextRates)
       setPreviousReadings(previous)
       setCurrentReadings(current)
-      setReadingDrafts(Object.fromEntries(nextApartments.map((apartment) => [
-        apartment.id,
-        {
-          previous: previous[apartment.id] === undefined ? '' : String(previous[apartment.id]),
-          current: current[apartment.id] === undefined ? '' : String(current[apartment.id]),
-        },
-      ])))
+      setBulkReadings(Object.fromEntries(Array.from({ length: 46 }, (_, index) => {
+        const number = index + 1
+        return [number, readingsByApartment.get(String(number)) ?? { previous: '', current: '' }]
+      })))
       setError('')
     } catch (loadError) {
       if (requestId === dataRequestId.current) {
         setError(`Veriler yüklenemedi: ${errorMessage(loadError)}`)
       }
-    } finally {
-      if (requestId === dataRequestId.current) setLoading(false)
     }
-  }, [month, session])
+  }, [access, month, session])
 
   useEffect(() => {
     // Month changes trigger a Supabase fetch; its response updates the dependent UI state.
@@ -215,42 +376,56 @@ function App() {
 
   function handleMonthChange(value: string) {
     if (!value) return
-    setLoading(true)
     setError('')
     setNotice('')
     setMonth(value)
   }
 
-  async function saveRates(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!supabase) return
+  async function persistRates(): Promise<boolean> {
+    if (!supabase || !isManager || !access) {
+      setError('Yalnızca yönetici aidat fiyatlarını değiştirebilir.')
+      return false
+    }
     const rows = apartmentTypes.map((type) => ({
       rate_month: monthDate(month),
       apartment_type: type,
+      owner_id: access.owner_id,
       dues: Number(rates[type].dues),
       hot_water_price: Number(rates[type].hotWater),
     }))
     if (rows.some((row) => !Number.isFinite(row.dues) || !Number.isFinite(row.hot_water_price)
       || row.dues < 0 || row.hot_water_price < 0)) {
       setError('Aidat ve sıcak su birim fiyatları sıfır veya daha büyük olmalıdır.')
-      return
+      return false
     }
     setSavingRates(true)
     setError('')
     setNotice('')
-    const { error: saveError } = await supabase.from('monthly_rates')
-      .upsert(rows, { onConflict: 'owner_id,rate_month,apartment_type' })
-    setSavingRates(false)
-    if (saveError) {
-      setError(`Fiyatlar kaydedilemedi: ${saveError.message}`)
-      return
+    try {
+      const { error: saveError } = await supabase.from('monthly_rates')
+        .upsert(rows, { onConflict: 'owner_id,rate_month,apartment_type' })
+      if (saveError) {
+        setError(`Fiyatlar kaydedilemedi: ${saveError.message}`)
+        return false
+      }
+      setNotice(`${monthLabel(month)} fiyatları kaydedildi.`)
+      return true
+    } catch (saveError) {
+      setError(`Fiyatlar kaydedilemedi: ${errorMessage(saveError)}`)
+      return false
+    } finally {
+      setSavingRates(false)
     }
-    setNotice(`${monthLabel(month)} fiyatları kaydedildi.`)
+  }
+
+  async function saveRates(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await persistRates()
   }
 
   async function addApartment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!supabase) return
+    if (!supabase || !isManager || !access) return
     const normalizedUnitNumber = unitNumber.trim()
     if (!normalizedUnitNumber) {
       setError('Daire numarasını girin.')
@@ -262,6 +437,7 @@ function App() {
     const { error: insertError } = await supabase.from('apartments').insert({
       unit_number: normalizedUnitNumber,
       apartment_type: apartmentType,
+      owner_id: access.owner_id,
     })
     setSavingApartment(false)
     if (insertError) {
@@ -275,49 +451,171 @@ function App() {
     await loadData()
   }
 
-  function updateDraft(apartmentId: string, key: keyof ReadingDraft, value: string) {
-    setReadingDrafts((drafts) => ({
-      ...drafts,
-      [apartmentId]: { ...drafts[apartmentId], [key]: value },
-    }))
-  }
-
-  async function saveReading(apartment: Apartment) {
-    if (!supabase) return
-    const draft = readingDrafts[apartment.id]
-    const previousValue = Number(draft?.previous)
-    const currentValue = Number(draft?.current)
-    if (draft?.previous.trim() === '' || draft?.current.trim() === ''
-      || !Number.isFinite(previousValue) || !Number.isFinite(currentValue)
-      || previousValue < 0 || currentValue < previousValue) {
-      setError(`${apartment.unit_number} numaralı daire için geçerli iki endeks girin. Yeni endeks önceki endeksten küçük olamaz.`)
-      return
+  async function saveBulkApartments(allowIncomplete = false): Promise<boolean> {
+    if (!supabase || !access || (!isManager && !isConcierge)) return false
+    const rows = Array.from({ length: 46 }, (_, index) => {
+      const number = index + 1
+      const existing = apartments.find((apartment) => apartment.unit_number === String(number))
+      return {
+        number,
+        apartment_type: bulkTypes[number] || existing?.apartment_type || '',
+        readings: bulkReadings[number] ?? { previous: '', current: '' },
+      }
+    })
+    const unselected = rows.filter((row) => !row.apartment_type).map((row) => row.number)
+    if (isManager && !allowIncomplete && unselected.length > 0) {
+      setError(`Daire tipi seçilmemiş numaralar: ${unselected.join(', ')}.`)
+      return false
     }
 
-    setSavingReadings((saving) => ({ ...saving, [apartment.id]: true }))
+    for (const row of rows) {
+      const { previous, current } = row.readings
+      const hasPrevious = previous.trim() !== ''
+      const hasCurrent = current.trim() !== ''
+      if ((isManager && !allowIncomplete || isConcierge) && hasPrevious !== hasCurrent) {
+        setError(`${row.number} numaralı daire için önceki ve son endeks birlikte girilmelidir.`)
+        return false
+      }
+      if (hasPrevious && hasCurrent) {
+        const previousValue = Number(previous)
+        const currentValue = Number(current)
+        if (!Number.isFinite(previousValue) || !Number.isFinite(currentValue)
+          || previousValue < 0 || currentValue < previousValue) {
+          setError(`${row.number} numaralı dairede endeksler geçerli olmalı; son endeks önceki endeksten küçük olamaz.`)
+          return false
+        }
+      }
+    }
+
+    setSavingBulkApartments(true)
     setError('')
     setNotice('')
-    const previousMonth = shiftMonth(month, -1)
-    const { error: saveError } = await supabase.from('meter_readings').upsert([
-      {
-        apartment_id: apartment.id,
-        reading_month: monthDate(previousMonth),
-        index_value: previousValue,
-      },
-      {
-        apartment_id: apartment.id,
-        reading_month: monthDate(month),
-        index_value: currentValue,
-      },
-    ], { onConflict: 'apartment_id,reading_month' })
-    setSavingReadings((saving) => ({ ...saving, [apartment.id]: false }))
-    if (saveError) {
-      setError(`Endeksler kaydedilemedi: ${saveError.message}`)
+    try {
+      const apartmentRows = isManager ? rows.filter((row) => row.apartment_type) : []
+      const { data: savedApartments, error: apartmentError } = apartmentRows.length > 0
+        ? await supabase
+          .from('apartments')
+          .upsert(apartmentRows.map((row) => ({
+          unit_number: String(row.number),
+          apartment_type: row.apartment_type as ApartmentType,
+          owner_id: access.owner_id,
+        })), { onConflict: 'owner_id,unit_number' })
+        .select('id, unit_number')
+        : { data: [], error: null }
+      if (apartmentError) throw apartmentError
+
+      const apartmentIds = new Map([
+        ...apartments.map((apartment) => [apartment.unit_number, apartment.id] as const),
+        ...savedApartments.map((apartment) => [apartment.unit_number, apartment.id] as const),
+      ])
+      const previousMonth = shiftMonth(month, -1)
+      const meterRows = rows.flatMap((row) => {
+        const { previous, current } = row.readings
+        if (previous.trim() === '' || current.trim() === '') return []
+        const apartmentId = apartmentIds.get(String(row.number))
+        if (!apartmentId) throw new Error(`${row.number} numaralı daire kayıttan sonra bulunamadı.`)
+        return [
+          { apartment_id: apartmentId, owner_id: access.owner_id, reading_month: monthDate(previousMonth), index_value: Number(previous) },
+          { apartment_id: apartmentId, owner_id: access.owner_id, reading_month: monthDate(month), index_value: Number(current) },
+        ]
+      })
+
+      if (meterRows.length > 0) {
+        const { error: readingsError } = await supabase.from('meter_readings')
+          .upsert(meterRows, { onConflict: 'apartment_id,reading_month' })
+        if (readingsError) {
+          await loadData()
+          throw new Error(`Daireler kaydedildi ancak sayaç endeksleri kaydedilemedi: ${readingsError.message}`)
+        }
+      }
+
+      setNotice(isConcierge
+        ? 'Girilen sayaç endeksleri kaydedildi.'
+        : `Girilen daire bilgileri kaydedildi${meterRows.length > 0 ? ' ve endeksler saklandı' : ''}.`)
+      await loadData()
+      return true
+    } catch (bulkError) {
+      setError(`Toplu liste kaydedilemedi: ${errorMessage(bulkError)}`)
+      return false
+    } finally {
+      setSavingBulkApartments(false)
+    }
+  }
+
+  async function addBulkApartments(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await saveBulkApartments()
+  }
+
+  async function createShare() {
+    if (!supabase || !isManager) return
+    const shareRows = Array.from({ length: 46 }, (_, index) => {
+      const number = index + 1
+      const existing = apartments.find((apartment) => apartment.unit_number === String(number))
+      return {
+        number,
+        apartmentType: bulkTypes[number] || existing?.apartment_type || '',
+        reading: bulkReadings[number] ?? { previous: '', current: '' },
+      }
+    })
+    const incompleteApartments = shareRows.filter(({ apartmentType, reading }) => (
+      !apartmentType || reading.previous.trim() === '' || reading.current.trim() === ''
+    )).map(({ number }) => number)
+
+    const invalidReading = shareRows.find(({ reading }) => (
+      reading.previous.trim() !== ''
+      && reading.current.trim() !== ''
+      && (!Number.isFinite(Number(reading.previous))
+        || !Number.isFinite(Number(reading.current))
+        || Number(reading.previous) < 0
+        || Number(reading.current) < Number(reading.previous))
+    ))
+    if (invalidReading) {
+      setError(`${invalidReading.number} numaralı dairede endeksler geçerli olmalı; son endeks önceki endeksten küçük olamaz.`)
       return
     }
-    setPreviousReadings((readings) => ({ ...readings, [apartment.id]: previousValue }))
-    setCurrentReadings((readings) => ({ ...readings, [apartment.id]: currentValue }))
-    setNotice(`${apartment.unit_number} numaralı dairenin endeksleri kaydedildi.`)
+
+    const shareWindow = window.open('about:blank', '_blank')
+    if (!shareWindow) {
+      setError('Paylaşım sekmesi açılamadı. Tarayıcınızda açılır pencerelere izin verip tekrar deneyin.')
+      return
+    }
+    shareWindow.opener = null
+
+    setSavingShare(true)
+    setError('')
+    setNotice('')
+    try {
+      const ratesSaved = await persistRates()
+      if (!ratesSaved) {
+        shareWindow.close()
+        return
+      }
+      const saved = await saveBulkApartments(true)
+      if (!saved) {
+        shareWindow.close()
+        return
+      }
+
+      const { data: newShareId, error: createError } = await supabase
+        .rpc('create_shared_dues', { p_month: monthDate(month) })
+      if (createError) throw createError
+      if (typeof newShareId !== 'string') {
+        throw new Error('Paylaşım bağlantısı oluşturulamadı.')
+      }
+
+      const shareUrl = new URL(window.location.href)
+      shareUrl.searchParams.set('share', newShareId)
+      shareWindow.location.replace(shareUrl.toString())
+      setNotice(incompleteApartments.length > 0
+        ? `Paylaşım yeni sekmede açıldı. Bilgisi girilmediği için listeye eklenmeyen daireler: ${incompleteApartments.join(', ')}.`
+        : 'Paylaşım yeni sekmede açıldı.')
+    } catch (shareCreateError) {
+      shareWindow.close()
+      setError(`Paylaşım oluşturulamadı: ${errorMessage(shareCreateError)}`)
+    } finally {
+      setSavingShare(false)
+    }
   }
 
   const totals = useMemo(() => apartments.reduce((result, apartment) => {
@@ -333,6 +631,40 @@ function App() {
   }, { consumption: 0, amount: 0, complete: 0 }), [
     apartments, currentReadings, previousReadings, rates,
   ])
+
+  if (shareId) {
+    if (!isSupabaseConfigured) {
+      return <main className="share-shell"><p>Paylaşım görüntülenemiyor.</p></main>
+    }
+    if (shareLoading) {
+      return <main className="share-shell"><p>Paylaşım yükleniyor…</p></main>
+    }
+    if (shareError) {
+      return <main className="share-shell"><p role="alert">{shareError}</p></main>
+    }
+    return (
+      <main className="share-shell">
+        <h1>{monthLabel(sharedMonth)} aidat borç listesi</h1>
+        {sharedDues.length === 0
+          ? <p>Bu ay için girilmiş borç kaydı bulunmuyor.</p>
+          : (
+            <table className="share-table">
+              <thead>
+                <tr><th scope="col">Daire no</th><th scope="col">Güncel ayın aidat borcu</th></tr>
+              </thead>
+              <tbody>
+                {sharedDues.map((row) => (
+                  <tr key={row.apartment_number}>
+                    <th scope="row">{row.apartment_number}</th>
+                    <td>{formatMoney(Number(row.monthly_due))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+      </main>
+    )
+  }
 
   if (!isSupabaseConfigured) {
     return (
@@ -357,8 +689,8 @@ function App() {
         <Brand />
         <form className="auth-panel" onSubmit={handleAuth}>
           <span className="eyebrow">SAYAÇ TAKİP</span>
-          <h1>{isSignup ? 'Hesap oluşturun' : 'Yönetici girişi'}</h1>
-          <p>Daireleri, aylık fiyatları ve sayaç endekslerini yönetmek için giriş yapın.</p>
+          <h1>{isSignup ? 'Hesap oluşturun' : 'Hesabınıza giriş yapın'}</h1>
+          <p>Daire, aidat ve sayaç bilgilerinize erişmek için giriş yapın.</p>
           <label>E-posta
             <input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} />
           </label>
@@ -378,38 +710,61 @@ function App() {
     )
   }
 
+  if (accessLoading) {
+    return <main className="app-shell auth-shell"><Brand /><div className="message-panel">Kullanıcı rolü yükleniyor…</div></main>
+  }
+
+  if (!access) {
+    return (
+      <main className="app-shell auth-shell">
+        <Brand />
+        <div className="message-panel">
+          <h1>Erişim tanımlanmadı</h1>
+          <p>{error || 'Bu hesap için yönetici tarafından bir rol atanması gerekiyor. Yönetici erişimi doğrulanmış onuratabay@hotmail.com hesabına tanımlıdır.'}</p>
+          <button className="secondary-button" type="button" onClick={() => void handleSignOut()}>Çıkış yap</button>
+        </div>
+      </main>
+    )
+  }
+
   return (
     <main className="app-shell dashboard-shell">
       <header className="topbar">
         <Brand />
         <div className="user-actions">
           <span className="user-email">{session.user.email}</span>
+          <span className="role-badge">{roleLabel(access.role)}</span>
           <button className="text-button signout-button" type="button" onClick={handleSignOut}>Çıkış</button>
         </div>
       </header>
 
-      <section className="dashboard-intro">
-        <div>
-          <span className="eyebrow">YÖNETİM PANELİ</span>
-          <h1>Aylık sayaç ve aidat takibi</h1>
-          <p>Daire tipine göre aidatları belirleyin, aylık endeksleri girin; tüketim ve tutarlar otomatik hesaplansın.</p>
-        </div>
-        <label className="month-picker">Dönem
-          <input type="month" value={month} onChange={(event) => handleMonthChange(event.target.value)} />
-        </label>
-      </section>
+      {!isConcierge && (
+        <section className="dashboard-intro">
+          <div>
+            <span className="eyebrow">YÖNETİM PANELİ</span>
+            <h1>Aylık sayaç ve aidat takibi</h1>
+            <p>Daire tipine göre aidatları belirleyin, aylık endeksleri girin; tüketim ve tutarlar otomatik hesaplansın.</p>
+          </div>
+          <label className="month-picker">Dönem
+            <input type="month" value={month} onChange={(event) => handleMonthChange(event.target.value)} />
+          </label>
+        </section>
+      )}
 
       {error && <div className="alert error-alert" role="alert">{error}</div>}
       {notice && <div className="alert success-alert" role="status">{notice}</div>}
 
-      <section className="summary-grid" aria-label="Aylık özet">
-        <SummaryCard label="Kayıtlı daire" value={String(apartments.length)} detail="Tüm daireler" />
-        <SummaryCard label="Endeksi tamamlanan" value={`${totals.complete} / ${apartments.length}`} detail={monthLabel(month)} />
-        <SummaryCard label="Toplam sıcak su" value={`${new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 2 }).format(totals.consumption)} m³`} detail="Tamamlanan daireler" />
-        <SummaryCard label="Tahmini toplam" value={formatMoney(totals.amount)} detail="Aidat + sıcak su" />
-      </section>
+      {access.role !== 'concierge' && (
+        <section className="summary-grid" aria-label="Aylık özet">
+          <SummaryCard label="Kayıtlı daire" value={String(apartments.length)} detail="Tüm daireler" />
+          <SummaryCard label="Endeksi tamamlanan" value={`${totals.complete} / ${apartments.length}`} detail={monthLabel(month)} />
+          <SummaryCard label="Toplam sıcak su" value={`${new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 2 }).format(totals.consumption)} m³`} detail="Tamamlanan daireler" />
+          <SummaryCard label="Tahmini toplam" value={formatMoney(totals.amount)} detail="Aidat + sıcak su" />
+        </section>
+      )}
 
       <div className="management-grid">
+        {access.role !== 'concierge' && (
         <section className="panel rates-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">FİYATLANDIRMA</span><h2>Aylık fiyatlar</h2></div>
@@ -421,16 +776,18 @@ function App() {
               {apartmentTypes.map((type) => (
                 <div className="rate-row" key={type}>
                   <strong>{type}</strong>
-                  <label className="money-input"><span>₺</span><input aria-label={`${type} aylık aidat`} type="number" min="0" step="0.01" required value={rates[type].dues} onChange={(event) => setRates((oldRates) => ({ ...oldRates, [type]: { ...oldRates[type], dues: event.target.value } }))} /></label>
-                  <label className="money-input"><span>₺</span><input aria-label={`${type} sıcak su metreküp fiyatı`} type="number" min="0" step="0.01" required value={rates[type].hotWater} onChange={(event) => setRates((oldRates) => ({ ...oldRates, [type]: { ...oldRates[type], hotWater: event.target.value } }))} /></label>
+                  <label className="money-input"><span>₺</span><input aria-label={`${type} aylık aidat`} type="number" min="0" step="0.01" required disabled={!isManager} value={rates[type].dues} onChange={(event) => setRates((oldRates) => ({ ...oldRates, [type]: { ...oldRates[type], dues: event.target.value } }))} /></label>
+                  <label className="money-input"><span>₺</span><input aria-label={`${type} sıcak su metreküp fiyatı`} type="number" min="0" step="0.01" required disabled={!isManager} value={rates[type].hotWater} onChange={(event) => setRates((oldRates) => ({ ...oldRates, [type]: { ...oldRates[type], hotWater: event.target.value } }))} /></label>
                 </div>
               ))}
             </div>
             <p className="field-hint">Fiyatlar seçili aya kaydedilir; önceki ayların hesapları değişmez.</p>
-            <button className="primary-button" disabled={savingRates}>{savingRates ? 'Kaydediliyor…' : 'Fiyatları kaydet'}</button>
+            {isManager && <button className="primary-button" disabled={savingRates}>{savingRates ? 'Kaydediliyor…' : 'Fiyatları kaydet'}</button>}
           </form>
         </section>
+        )}
 
+        {isManager && (
         <section className="panel apartment-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">DAİRELER</span><h2>Daire ekle</h2></div>
@@ -447,63 +804,199 @@ function App() {
             </label>
             <button className="primary-button" disabled={savingApartment}>{savingApartment ? 'Ekleniyor…' : 'Daire ekle'}</button>
           </form>
-          <div className="apartment-list">
-            {apartments.length === 0
-              ? <p className="empty-copy">{loading ? 'Daireler yükleniyor…' : 'Henüz daire eklenmemiş.'}</p>
-              : apartments.map((apartment) => (
-                <div className="apartment-chip" key={apartment.id}>
-                  <span className="unit-avatar">{apartment.apartment_type}</span>
-                  <span>Daire {apartment.unit_number}</span>
-                  <span className="type-pill">{apartment.apartment_type}</span>
-                </div>
-              ))}
-          </div>
         </section>
+        )}
       </div>
 
-      <section className="panel readings-panel">
-        <div className="panel-heading readings-heading">
-          <div><span className="eyebrow">AYLIK GİRİŞ</span><h2>{monthLabel(month)} sayaç endeksleri</h2></div>
-          <span className="panel-caption">Tüketim = yeni endeks − önceki endeks</span>
-        </div>
-        {apartments.length === 0 ? (
-          <div className="empty-readings">{loading ? 'Veriler yükleniyor…' : 'Endeks girişi için önce daire ekleyin.'}</div>
-        ) : (
-          <div className="reading-list">
-            {apartments.map((apartment) => {
-              const draft = readingDrafts[apartment.id] ?? { previous: '', current: '' }
-              const previousValue = Number(draft.previous)
-              const currentValue = Number(draft.current)
-              const hasValues = draft.previous.trim() !== '' && draft.current.trim() !== ''
-              const consumption = hasValues && currentValue >= previousValue ? currentValue - previousValue : null
-              const rate = rates[apartment.apartment_type]
-              const amount = consumption === null ? null : Number(rate.dues) + consumption * Number(rate.hotWater)
-              return (
-                <article className="reading-card" key={apartment.id}>
-                  <div className="reading-unit">
-                    <span className="unit-avatar">{apartment.apartment_type}</span>
-                    <span><strong>Daire {apartment.unit_number}</strong><small>{apartment.apartment_type} · {formatMoney(Number(rate.dues))} aidat</small></span>
-                  </div>
-                  <label>Önceki ay ({monthLabel(shiftMonth(month, -1))}) endeksi
-                    <input type="number" min="0" step="0.001" inputMode="decimal" value={draft.previous} onChange={(event) => updateDraft(apartment.id, 'previous', event.target.value)} placeholder="Önceki endeks" />
-                  </label>
-                  <label>{monthLabel(month)} endeksi
-                    <input type="number" min="0" step="0.001" inputMode="decimal" value={draft.current} onChange={(event) => updateDraft(apartment.id, 'current', event.target.value)} placeholder="Yeni endeks" />
-                  </label>
-                  <div className="calculation">
-                    <span>{consumption === null ? 'Tüketim bekleniyor' : `${new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 3 }).format(consumption)} m³`}</span>
-                    <strong>{amount === null ? '—' : formatMoney(amount)}</strong>
-                  </div>
-                  <button className="secondary-button" type="button" disabled={savingReadings[apartment.id]} onClick={() => void saveReading(apartment)}>
-                    {savingReadings[apartment.id] ? 'Kaydediliyor…' : 'Endeksleri kaydet'}
-                  </button>
-                </article>
-              )
-            })}
+      {isManager && (
+        <section className="panel team-panel">
+          <div className="panel-heading">
+            <div><span className="eyebrow">YÖNETİCİ PANELİ</span><h2>Kullanıcılar ve roller</h2></div>
+            <div className="directory-heading-actions">
+              <span className="panel-caption">{managedUsers.length} kayıtlı kullanıcı</span>
+              <button className="secondary-button" type="button" disabled={usersLoading} onClick={() => void loadManagedUsers()}>
+                {usersLoading ? 'Yenileniyor…' : 'Listeyi yenile'}
+              </button>
+            </div>
           </div>
-        )}
+          <label className="user-search">Kullanıcı ara
+            <input
+              type="search"
+              value={userSearch}
+              onChange={(event) => setUserSearch(event.target.value)}
+              placeholder="E-posta adresine göre ara"
+            />
+          </label>
+          <div className="user-directory-scroll">
+            <table className="user-directory">
+              <thead>
+                <tr>
+                  <th scope="col">E-posta</th>
+                  <th scope="col">Rol</th>
+                  <th scope="col">Son giriş</th>
+                  <th scope="col">Kayıt tarihi</th>
+                </tr>
+              </thead>
+              <tbody>
+                {managedUsers
+                  .filter((user) => user.email.toLocaleLowerCase('tr').includes(userSearch.trim().toLocaleLowerCase('tr')))
+                  .map((user) => (
+                    <tr key={user.user_id}>
+                      <th scope="row">{user.email}</th>
+                      <td>
+                        {user.role === 'manager'
+                          ? <span className="role-badge">Yönetici</span>
+                          : (
+                            <select
+                              aria-label={`${user.email} rolü`}
+                              disabled={updatingUserId === user.user_id}
+                              value={user.role ?? ''}
+                              onChange={(event) => {
+                                const value = event.target.value
+                                void changeUserRole(
+                                  user,
+                                  value === '' ? null : value as Exclude<AppRole, 'manager'>,
+                                )
+                              }}
+                            >
+                              <option value="">Rol atanmamış</option>
+                              <option value="accountant">Muhasebeci — görüntüleme</option>
+                              <option value="concierge">Apartman görevlisi — endeks girişi</option>
+                            </select>
+                          )}
+                      </td>
+                      <td>{formatTimestamp(user.last_sign_in_at)}</td>
+                      <td>{formatTimestamp(user.created_at)}</td>
+                    </tr>
+                  ))}
+                {!usersLoading && managedUsers.length === 0 && (
+                  <tr><td colSpan={4} className="directory-empty">Kayıtlı kullanıcı bulunamadı.</td></tr>
+                )}
+                {!usersLoading && managedUsers.length > 0
+                  && managedUsers.filter((user) => user.email.toLocaleLowerCase('tr').includes(userSearch.trim().toLocaleLowerCase('tr'))).length === 0 && (
+                    <tr><td colSpan={4} className="directory-empty">Aramanızla eşleşen kullanıcı bulunamadı.</td></tr>
+                  )}
+              </tbody>
+            </table>
+            {usersLoading && <p className="directory-loading">Kullanıcılar yükleniyor…</p>}
+          </div>
+          <p className="field-hint">Yalnızca kayıtlı hesaplar listelenir. Son giriş bilgisi, hesabın Supabase Authentication üzerinden son başarılı oturum açma zamanıdır. Yönetici rolü değiştirilemez.</p>
+        </section>
+      )}
+
+      <section className="panel bulk-apartments-panel">
+        <div className="panel-heading">
+          <div><span className="eyebrow">DAİRE VE SAYAÇ TAKİBİ</span><h2>1–46 daire listesi</h2></div>
+          {isConcierge
+            ? (
+              <label className="table-month-picker">Dönem
+                <input type="month" value={month} onChange={(event) => handleMonthChange(event.target.value)} />
+              </label>
+            )
+            : <span className="panel-caption">Endeksleri bu ay için girin · Tüketim farkı otomatik hesaplanır</span>}
+        </div>
+        <form className="bulk-apartment-form" onSubmit={addBulkApartments}>
+          <div className="bulk-table-scroll">
+            <table className="bulk-apartment-table">
+              <thead>
+                <tr>
+                  <th scope="col">Daire no</th>
+                  <th scope="col">Daire tipi</th>
+                  <th scope="col">Önceki endeks</th>
+                  <th scope="col">Son endeks</th>
+                  {access.role !== 'concierge' && <th scope="col">Toplam güncel aidat</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {Array.from({ length: 46 }, (_, index) => {
+                  const number = index + 1
+                  const existingApartment = apartments.find((apartment) => apartment.unit_number === String(number))
+                  const selectedType = bulkTypes[number] || existingApartment?.apartment_type || ''
+                  const reading = bulkReadings[number] ?? { previous: '', current: '' }
+                  const rate = selectedType ? rates[selectedType as ApartmentType] : null
+                  const hasReadings = reading.previous.trim() !== '' && reading.current.trim() !== ''
+                  const previousIndex = Number(reading.previous)
+                  const currentIndex = Number(reading.current)
+                  const totalDue = rate && hasReadings && currentIndex >= previousIndex
+                    ? Number(rate.dues) + (currentIndex - previousIndex) * Number(rate.hotWater)
+                    : null
+                  return (
+                    <tr key={number}>
+                      <th scope="row">{number}</th>
+                      <td>
+                        <select
+                          aria-label={`${number} numaralı dairenin tipi`}
+                          disabled={!isManager}
+                          value={selectedType}
+                          onChange={(event) => setBulkTypes((types) => ({
+                            ...types,
+                            [number]: event.target.value as ApartmentType,
+                          }))}
+                        >
+                          <option value="">Daire tipi seçin</option>
+                          {apartmentTypes.map((type) => <option key={type} value={type}>{type}</option>)}
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          aria-label={`${number} numaralı dairenin önceki endeksi`}
+                          type="number"
+                          min="0"
+                          step="0.001"
+                          inputMode="decimal"
+                          placeholder="Endeks"
+                          disabled={access.role === 'accountant'}
+                          value={reading.previous}
+                          onChange={(event) => setBulkReadings((readings) => ({
+                            ...readings,
+                            [number]: { ...reading, previous: event.target.value },
+                          }))}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label={`${number} numaralı dairenin son endeksi`}
+                          type="number"
+                          min="0"
+                          step="0.001"
+                          inputMode="decimal"
+                          placeholder="Endeks"
+                          disabled={access.role === 'accountant'}
+                          value={reading.current}
+                          onChange={(event) => setBulkReadings((readings) => ({
+                            ...readings,
+                            [number]: { ...reading, current: event.target.value },
+                          }))}
+                        />
+                      </td>
+                      {access.role !== 'concierge' && <td className="bulk-dues-value">{totalDue === null ? '—' : formatMoney(totalDue)}</td>}
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="bulk-table-footer">
+            <span>{access.role === 'concierge' ? 'Yalnızca sayaç endeksleri düzenlenebilir.' : access.role === 'accountant' ? 'Görüntüleme yetkisi — kayıtlar değiştirilemez.' : 'Toplam borç = aidat + sıcak su. Paylaşım bağlantısını açan herkes sabit listeyi görebilir.'}</span>
+            {isManager && (
+              <div className="bulk-footer-actions">
+                <button className="secondary-button" type="submit" disabled={savingRates || savingBulkApartments || savingShare}>
+                  {savingBulkApartments ? 'Kaydediliyor…' : 'Daire ve endeksleri kaydet'}
+                </button>
+                <button className="primary-button" type="button" disabled={savingRates || savingBulkApartments || savingShare} onClick={() => void createShare()}>
+                  {savingShare ? 'Paylaşım hazırlanıyor…' : 'Listeyi paylaş'}
+                </button>
+              </div>
+            )}
+            {isConcierge && (
+              <button className="primary-button" type="submit" disabled={savingBulkApartments}>
+                {savingBulkApartments ? 'Endeksler kaydediliyor…' : 'Endeksleri kaydet'}
+              </button>
+            )}
+          </div>
+        </form>
       </section>
-      <footer className="footer">Sayaç Takip <span>·</span> Aylık aidat ve sıcak su takibi</footer>
+      {!isConcierge && <footer className="footer">Sayaç Takip <span>·</span> Aylık aidat ve sıcak su takibi</footer>}
     </main>
   )
 }
