@@ -73,9 +73,41 @@ function monthDate(month: string) {
   return `${month}-01`
 }
 
+function monthNameLabel(month: string) {
+  return new Intl.DateTimeFormat('tr-TR', { month: 'long', timeZone: 'UTC' })
+    .format(new Date(`${month}-01T00:00:00.000Z`))
+}
+
 function monthLabel(month: string) {
   return new Intl.DateTimeFormat('tr-TR', { month: 'long', year: 'numeric', timeZone: 'UTC' })
     .format(new Date(`${month}-01T00:00:00.000Z`))
+}
+
+// Meter indexes are entered as read off the meter: the last three digits are litres
+// (123456 = 123.456 m³). A separator before those three digits is optional.
+// Indexes are handled as whole litres so differences stay exact; the database stores m³.
+function parseIndexLitres(value: string) {
+  const trimmed = value.trim()
+  if (/^\d+$/.test(trimmed)) return Number(trimmed)
+  const match = /^(\d+)[.,](\d{3})$/.exec(trimmed)
+  return match ? Number(match[1] + match[2]) : null
+}
+
+function litresFromIndex(value: number) {
+  return Math.round(value * 1000)
+}
+
+function formatIndex(value: number) {
+  return String(litresFromIndex(value))
+}
+
+function formatCubicMeters(litres: number) {
+  return `${(litres / 1000).toFixed(3)} m³`
+}
+
+// Rounded to kuruş, matching the numeric(12, 2) cast in create_shared_dues.
+function waterCost(litres: number, pricePerCubicMeter: number) {
+  return Math.round((litres * Math.round(pricePerCubicMeter * 100)) / 1000) / 100
 }
 
 function formatMoney(value: number) {
@@ -119,6 +151,7 @@ function App() {
   const [updatingUserId, setUpdatingUserId] = useState('')
   const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
   const [isSignup, setIsSignup] = useState(false)
+  const [isPasswordRecovery, setIsPasswordRecovery] = useState(false)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [authBusy, setAuthBusy] = useState(false)
@@ -137,9 +170,8 @@ function App() {
   const [notice, setNotice] = useState('')
   const [unitNumber, setUnitNumber] = useState('')
   const [apartmentType, setApartmentType] = useState<ApartmentType>('1+1')
-  const [bulkTypes, setBulkTypes] = useState<Record<number, ApartmentType | ''>>(
-    () => Object.fromEntries(Array.from({ length: 46 }, (_, index) => [index + 1, ''])),
-  )
+  const [savingTypeUnit, setSavingTypeUnit] = useState('')
+  const [monthlyDues, setMonthlyDues] = useState<Record<string, number>>({})
   const dataRequestId = useRef(0)
 
   useEffect(() => {
@@ -155,7 +187,8 @@ function App() {
       setAccessLoading(Boolean(data.session))
       setAuthReady(true)
     })
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      if (event === 'PASSWORD_RECOVERY') setIsPasswordRecovery(true)
       setSession(nextSession)
       setAccess(null)
       setAccessLoading(Boolean(nextSession))
@@ -197,6 +230,9 @@ function App() {
 
   const isManager = access?.role === 'manager'
   const isConcierge = access?.role === 'concierge'
+  const isAccountant = access?.role === 'accountant'
+  // Every signed-in role except the read-only accountant may save the bulk list.
+  const canSaveBulk = Boolean(access) && access?.role !== 'accountant'
 
   const loadManagedUsers = useCallback(async () => {
     if (!supabase || !isManager) return
@@ -277,6 +313,16 @@ function App() {
     if (!supabase || !session || !access) return
     const requestId = ++dataRequestId.current
     try {
+      // Accountants only receive apartment numbers and dues; the tables behind them are closed to this role.
+      if (access.role === 'accountant') {
+        const { data, error: duesError } = await supabase.rpc('get_monthly_dues', { p_month: monthDate(month) })
+        if (duesError) throw duesError
+        if (requestId !== dataRequestId.current) return
+        setMonthlyDues(Object.fromEntries((data as SharedDue[]).map((row) => [row.apartment_number, Number(row.monthly_due)])))
+        setError('')
+        return
+      }
+
       const previousMonth = shiftMonth(month, -1)
       const [apartmentResult, rateResult, readingResult] = await Promise.all([
         supabase.from('apartments').select('id, unit_number, apartment_type').order('unit_number'),
@@ -320,8 +366,8 @@ function App() {
         const previousIndex = previous[apartment.id]
         const currentIndex = current[apartment.id]
         readingsByApartment.set(apartment.unit_number, {
-          previous: previousIndex === undefined ? '' : String(previousIndex),
-          current: currentIndex === undefined ? '' : String(currentIndex),
+          previous: previousIndex === undefined ? '' : formatIndex(Number(previousIndex)),
+          current: currentIndex === undefined ? '' : formatIndex(Number(currentIndex)),
         })
       }
 
@@ -363,6 +409,49 @@ function App() {
       }
     } catch (authError) {
       setError(errorMessage(authError))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function handlePasswordReset() {
+    if (!supabase) return
+    if (!email.trim()) {
+      setError('Şifre sıfırlama bağlantısı için önce e-posta adresinizi girin.')
+      return
+    }
+
+    setAuthBusy(true)
+    setAuthMessage('')
+    setError('')
+    try {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: window.location.origin,
+      })
+      if (resetError) throw resetError
+      setAuthMessage('Şifre sıfırlama bağlantısı e-posta adresinize gönderildiyse gelen kutunuzu kontrol edin.')
+    } catch (resetError) {
+      setError(errorMessage(resetError))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function handlePasswordUpdate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!supabase) return
+
+    setAuthBusy(true)
+    setAuthMessage('')
+    setError('')
+    try {
+      const { error: updateError } = await supabase.auth.updateUser({ password })
+      if (updateError) throw updateError
+      setIsPasswordRecovery(false)
+      setPassword('')
+      setNotice('Şifreniz güncellendi.')
+    } catch (updateError) {
+      setError(errorMessage(updateError))
     } finally {
       setAuthBusy(false)
     }
@@ -451,37 +540,61 @@ function App() {
     await loadData()
   }
 
+  async function changeApartmentType(unit: string, type: ApartmentType) {
+    if (!supabase || !canSaveBulk) return
+    setSavingTypeUnit(unit)
+    setError('')
+    setNotice('')
+    const { data, error: typeError } = await supabase.rpc('set_apartment_type', {
+      p_unit_number: unit,
+      p_apartment_type: type,
+    })
+    setSavingTypeUnit('')
+    if (typeError) {
+      setError(`Daire tipi kaydedilemedi: ${typeError.message}`)
+      return
+    }
+    const saved = data as Apartment
+    setApartments((oldApartments) => [
+      ...oldApartments.filter((apartment) => apartment.unit_number !== saved.unit_number),
+      { id: saved.id, unit_number: saved.unit_number, apartment_type: saved.apartment_type },
+    ])
+    setNotice(`${unit} numaralı dairenin tipi ${type} olarak kaydedildi.`)
+  }
+
   async function saveBulkApartments(allowIncomplete = false): Promise<boolean> {
-    if (!supabase || !access || (!isManager && !isConcierge)) return false
+    if (!supabase || !access || !canSaveBulk) return false
+    const apartmentIds = new Map(apartments.map((apartment) => [apartment.unit_number, apartment.id] as const))
     const rows = Array.from({ length: 46 }, (_, index) => {
       const number = index + 1
-      const existing = apartments.find((apartment) => apartment.unit_number === String(number))
       return {
         number,
-        apartment_type: bulkTypes[number] || existing?.apartment_type || '',
+        apartmentId: apartmentIds.get(String(number)),
         readings: bulkReadings[number] ?? { previous: '', current: '' },
       }
     })
-    const unselected = rows.filter((row) => !row.apartment_type).map((row) => row.number)
-    if (isManager && !allowIncomplete && unselected.length > 0) {
-      setError(`Daire tipi seçilmemiş numaralar: ${unselected.join(', ')}.`)
-      return false
-    }
 
     for (const row of rows) {
       const { previous, current } = row.readings
       const hasPrevious = previous.trim() !== ''
       const hasCurrent = current.trim() !== ''
-      if ((isManager && !allowIncomplete || isConcierge) && hasPrevious !== hasCurrent) {
+      if (!allowIncomplete && hasPrevious !== hasCurrent) {
         setError(`${row.number} numaralı daire için önceki ve son endeks birlikte girilmelidir.`)
         return false
       }
+      if ((hasPrevious || hasCurrent) && !row.apartmentId) {
+        setError(`${row.number} numaralı daire için önce daire tipini seçin.`)
+        return false
+      }
       if (hasPrevious && hasCurrent) {
-        const previousValue = Number(previous)
-        const currentValue = Number(current)
-        if (!Number.isFinite(previousValue) || !Number.isFinite(currentValue)
-          || previousValue < 0 || currentValue < previousValue) {
-          setError(`${row.number} numaralı dairede endeksler geçerli olmalı; son endeks önceki endeksten küçük olamaz.`)
+        const previousLitres = parseIndexLitres(previous)
+        const currentLitres = parseIndexLitres(current)
+        if (previousLitres === null || currentLitres === null) {
+          setError(`${row.number} numaralı dairede endeksler sayaçtaki gibi 123456 biçiminde girilmelidir (son 3 hane litre).`)
+          return false
+        }
+        if (currentLitres < previousLitres) {
+          setError(`${row.number} numaralı dairede son endeks önceki endeksten küçük olamaz.`)
           return false
         }
       }
@@ -491,51 +604,28 @@ function App() {
     setError('')
     setNotice('')
     try {
-      const apartmentRows = isManager ? rows.filter((row) => row.apartment_type) : []
-      const { data: savedApartments, error: apartmentError } = apartmentRows.length > 0
-        ? await supabase
-          .from('apartments')
-          .upsert(apartmentRows.map((row) => ({
-          unit_number: String(row.number),
-          apartment_type: row.apartment_type as ApartmentType,
-          owner_id: access.owner_id,
-        })), { onConflict: 'owner_id,unit_number' })
-        .select('id, unit_number')
-        : { data: [], error: null }
-      if (apartmentError) throw apartmentError
-
-      const apartmentIds = new Map([
-        ...apartments.map((apartment) => [apartment.unit_number, apartment.id] as const),
-        ...savedApartments.map((apartment) => [apartment.unit_number, apartment.id] as const),
-      ])
       const previousMonth = shiftMonth(month, -1)
-      const meterRows = rows.flatMap((row) => {
-        const { previous, current } = row.readings
-        if (previous.trim() === '' || current.trim() === '') return []
-        const apartmentId = apartmentIds.get(String(row.number))
-        if (!apartmentId) throw new Error(`${row.number} numaralı daire kayıttan sonra bulunamadı.`)
+      const meterRows = rows.flatMap(({ apartmentId, readings: { previous, current } }) => {
+        const previousLitres = parseIndexLitres(previous)
+        const currentLitres = parseIndexLitres(current)
+        if (!apartmentId || previousLitres === null || currentLitres === null) return []
         return [
-          { apartment_id: apartmentId, owner_id: access.owner_id, reading_month: monthDate(previousMonth), index_value: Number(previous) },
-          { apartment_id: apartmentId, owner_id: access.owner_id, reading_month: monthDate(month), index_value: Number(current) },
+          { apartment_id: apartmentId, owner_id: access.owner_id, reading_month: monthDate(previousMonth), index_value: previousLitres / 1000 },
+          { apartment_id: apartmentId, owner_id: access.owner_id, reading_month: monthDate(month), index_value: currentLitres / 1000 },
         ]
       })
 
       if (meterRows.length > 0) {
         const { error: readingsError } = await supabase.from('meter_readings')
           .upsert(meterRows, { onConflict: 'apartment_id,reading_month' })
-        if (readingsError) {
-          await loadData()
-          throw new Error(`Daireler kaydedildi ancak sayaç endeksleri kaydedilemedi: ${readingsError.message}`)
-        }
+        if (readingsError) throw readingsError
       }
 
-      setNotice(isConcierge
-        ? 'Girilen sayaç endeksleri kaydedildi.'
-        : `Girilen daire bilgileri kaydedildi${meterRows.length > 0 ? ' ve endeksler saklandı' : ''}.`)
+      setNotice(meterRows.length > 0 ? 'Girilen sayaç endeksleri kaydedildi.' : 'Kaydedilecek endeks girilmedi.')
       await loadData()
       return true
     } catch (bulkError) {
-      setError(`Toplu liste kaydedilemedi: ${errorMessage(bulkError)}`)
+      setError(`Endeksler kaydedilemedi: ${errorMessage(bulkError)}`)
       return false
     } finally {
       setSavingBulkApartments(false)
@@ -554,7 +644,7 @@ function App() {
       const existing = apartments.find((apartment) => apartment.unit_number === String(number))
       return {
         number,
-        apartmentType: bulkTypes[number] || existing?.apartment_type || '',
+        apartmentType: existing?.apartment_type ?? '',
         reading: bulkReadings[number] ?? { previous: '', current: '' },
       }
     })
@@ -562,16 +652,14 @@ function App() {
       !apartmentType || reading.previous.trim() === '' || reading.current.trim() === ''
     )).map(({ number }) => number)
 
-    const invalidReading = shareRows.find(({ reading }) => (
-      reading.previous.trim() !== ''
-      && reading.current.trim() !== ''
-      && (!Number.isFinite(Number(reading.previous))
-        || !Number.isFinite(Number(reading.current))
-        || Number(reading.previous) < 0
-        || Number(reading.current) < Number(reading.previous))
-    ))
+    const invalidReading = shareRows.find(({ reading }) => {
+      if (reading.previous.trim() === '' || reading.current.trim() === '') return false
+      const previousLitres = parseIndexLitres(reading.previous)
+      const currentLitres = parseIndexLitres(reading.current)
+      return previousLitres === null || currentLitres === null || currentLitres < previousLitres
+    })
     if (invalidReading) {
-      setError(`${invalidReading.number} numaralı dairede endeksler geçerli olmalı; son endeks önceki endeksten küçük olamaz.`)
+      setError(`${invalidReading.number} numaralı dairede endeksler sayaçtaki gibi 123456 biçiminde girilmeli; son endeks önceki endeksten küçük olamaz.`)
       return
     }
 
@@ -622,13 +710,13 @@ function App() {
     const previous = previousReadings[apartment.id]
     const current = currentReadings[apartment.id]
     if (previous === undefined || current === undefined) return result
-    const consumption = current - previous
+    const consumptionLitres = litresFromIndex(current) - litresFromIndex(previous)
     const rate = rates[apartment.apartment_type]
-    result.consumption += consumption
-    result.amount += Number(rate.dues) + consumption * Number(rate.hotWater)
+    result.consumptionLitres += consumptionLitres
+    result.amount += Number(rate.dues) + waterCost(consumptionLitres, Number(rate.hotWater))
     result.complete += 1
     return result
-  }, { consumption: 0, amount: 0, complete: 0 }), [
+  }, { consumptionLitres: 0, amount: 0, complete: 0 }), [
     apartments, currentReadings, previousReadings, rates,
   ])
 
@@ -683,6 +771,26 @@ function App() {
     return <main className="app-shell auth-shell"><Brand /><div className="message-panel">Bağlantı kuruluyor…</div></main>
   }
 
+  if (isPasswordRecovery) {
+    return (
+      <main className="app-shell auth-shell">
+        <Brand />
+        <form className="auth-panel" onSubmit={handlePasswordUpdate}>
+          <span className="eyebrow">SAYAÇ TAKİP</span>
+          <h1>Yeni şifre belirleyin</h1>
+          <p>Hesabınız için kullanmak istediğiniz yeni şifreyi girin.</p>
+          <label>Yeni şifre
+            <input type="password" autoComplete="new-password" minLength={6} required value={password} onChange={(event) => setPassword(event.target.value)} />
+          </label>
+          {error && <p className="alert error-alert" role="alert">{error}</p>}
+          <button className="primary-button full-button" disabled={authBusy}>
+            {authBusy ? 'İşleniyor…' : 'Şifreyi güncelle'}
+          </button>
+        </form>
+      </main>
+    )
+  }
+
   if (!session) {
     return (
       <main className="app-shell auth-shell">
@@ -702,6 +810,11 @@ function App() {
           <button className="primary-button full-button" disabled={authBusy}>
             {authBusy ? 'İşleniyor…' : isSignup ? 'Hesap oluştur' : 'Giriş yap'}
           </button>
+          {!isSignup && (
+            <button className="text-button" type="button" disabled={authBusy} onClick={() => void handlePasswordReset()}>
+              Şifremi unuttum
+            </button>
+          )}
           <button className="text-button" type="button" onClick={() => { setIsSignup(!isSignup); setError(''); setAuthMessage('') }}>
             {isSignup ? 'Zaten hesabınız var mı? Giriş yapın' : 'İlk kez mi kullanıyorsunuz? Hesap oluşturun'}
           </button>
@@ -738,7 +851,7 @@ function App() {
         </div>
       </header>
 
-      {!isConcierge && (
+      {isManager && (
         <section className="dashboard-intro">
           <div>
             <span className="eyebrow">YÖNETİM PANELİ</span>
@@ -754,17 +867,17 @@ function App() {
       {error && <div className="alert error-alert" role="alert">{error}</div>}
       {notice && <div className="alert success-alert" role="status">{notice}</div>}
 
-      {access.role !== 'concierge' && (
+      {isManager && (
         <section className="summary-grid" aria-label="Aylık özet">
           <SummaryCard label="Kayıtlı daire" value={String(apartments.length)} detail="Tüm daireler" />
           <SummaryCard label="Endeksi tamamlanan" value={`${totals.complete} / ${apartments.length}`} detail={monthLabel(month)} />
-          <SummaryCard label="Toplam sıcak su" value={`${new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 2 }).format(totals.consumption)} m³`} detail="Tamamlanan daireler" />
+          <SummaryCard label="Toplam sıcak su" value={formatCubicMeters(totals.consumptionLitres)} detail="Tamamlanan daireler" />
           <SummaryCard label="Tahmini toplam" value={formatMoney(totals.amount)} detail="Aidat + sıcak su" />
         </section>
       )}
 
       <div className="management-grid">
-        {access.role !== 'concierge' && (
+        {isManager && (
         <section className="panel rates-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">FİYATLANDIRMA</span><h2>Aylık fiyatlar</h2></div>
@@ -860,7 +973,7 @@ function App() {
                               }}
                             >
                               <option value="">Rol atanmamış</option>
-                              <option value="accountant">Muhasebeci — görüntüleme</option>
+                              <option value="accountant">Muhasebeci — yalnızca aidat listesi</option>
                               <option value="concierge">Apartman görevlisi — endeks girişi</option>
                             </select>
                           )}
@@ -884,6 +997,33 @@ function App() {
         </section>
       )}
 
+      {isAccountant ? (
+        <section className="panel bulk-apartments-panel">
+          <div className="panel-heading">
+            <div><span className="eyebrow">AİDAT LİSTESİ</span><h2>{monthLabel(month)} aidatları</h2></div>
+            <label className="table-month-picker">Dönem
+              <input type="month" value={month} onChange={(event) => handleMonthChange(event.target.value)} />
+            </label>
+          </div>
+          <table className="share-table">
+            <thead>
+              <tr><th scope="col">Daire no</th><th scope="col">{monthNameLabel(month)} aidatı</th></tr>
+            </thead>
+            <tbody>
+              {Array.from({ length: 46 }, (_, index) => {
+                const number = String(index + 1)
+                const due = monthlyDues[number]
+                return (
+                  <tr key={number}>
+                    <th scope="row">{number}</th>
+                    <td>{due === undefined ? '—' : formatMoney(due)}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </section>
+      ) : (
       <section className="panel bulk-apartments-panel">
         <div className="panel-heading">
           <div><span className="eyebrow">DAİRE VE SAYAÇ TAKİBİ</span><h2>1–46 daire listesi</h2></div>
@@ -904,47 +1044,46 @@ function App() {
                   <th scope="col">Daire tipi</th>
                   <th scope="col">Önceki endeks</th>
                   <th scope="col">Son endeks</th>
-                  {access.role !== 'concierge' && <th scope="col">Toplam güncel aidat</th>}
+                  <th scope="col">{monthNameLabel(month)} aidatı</th>
                 </tr>
               </thead>
               <tbody>
                 {Array.from({ length: 46 }, (_, index) => {
                   const number = index + 1
                   const existingApartment = apartments.find((apartment) => apartment.unit_number === String(number))
-                  const selectedType = bulkTypes[number] || existingApartment?.apartment_type || ''
+                  const selectedType = existingApartment?.apartment_type ?? ''
                   const reading = bulkReadings[number] ?? { previous: '', current: '' }
                   const rate = selectedType ? rates[selectedType as ApartmentType] : null
-                  const hasReadings = reading.previous.trim() !== '' && reading.current.trim() !== ''
-                  const previousIndex = Number(reading.previous)
-                  const currentIndex = Number(reading.current)
-                  const totalDue = rate && hasReadings && currentIndex >= previousIndex
-                    ? Number(rate.dues) + (currentIndex - previousIndex) * Number(rate.hotWater)
+                  const previousLitres = parseIndexLitres(reading.previous)
+                  const currentLitres = parseIndexLitres(reading.current)
+                  const consumptionLitres = previousLitres !== null && currentLitres !== null && currentLitres >= previousLitres
+                    ? currentLitres - previousLitres
                     : null
+                  const water = rate && consumptionLitres !== null ? waterCost(consumptionLitres, Number(rate.hotWater)) : null
+                  const totalDue = rate && water !== null ? Number(rate.dues) + water : null
                   return (
                     <tr key={number}>
                       <th scope="row">{number}</th>
-                      <td>
-                        <select
-                          aria-label={`${number} numaralı dairenin tipi`}
-                          disabled={!isManager}
-                          value={selectedType}
-                          onChange={(event) => setBulkTypes((types) => ({
-                            ...types,
-                            [number]: event.target.value as ApartmentType,
-                          }))}
-                        >
-                          <option value="">Daire tipi seçin</option>
-                          {apartmentTypes.map((type) => <option key={type} value={type}>{type}</option>)}
-                        </select>
+                      <td className="bulk-type-cell">
+                        {canSaveBulk
+                          ? (
+                            <select
+                              aria-label={`${number} numaralı dairenin tipi`}
+                              disabled={savingTypeUnit === String(number)}
+                              value={selectedType}
+                              onChange={(event) => void changeApartmentType(String(number), event.target.value as ApartmentType)}
+                            >
+                              <option value="" disabled>Daire tipi seçin</option>
+                              {apartmentTypes.map((type) => <option key={type} value={type}>{type}</option>)}
+                            </select>
+                          )
+                          : <span className="bulk-type-readonly">{selectedType || 'Tanımsız'}</span>}
                       </td>
-                      <td>
+                      <td data-label="Önceki endeks">
                         <input
                           aria-label={`${number} numaralı dairenin önceki endeksi`}
-                          type="number"
-                          min="0"
-                          step="0.001"
-                          inputMode="decimal"
-                          placeholder="Endeks"
+                          type="text"
+                          inputMode="numeric"
                           disabled={access.role === 'accountant'}
                           value={reading.previous}
                           onChange={(event) => setBulkReadings((readings) => ({
@@ -953,14 +1092,11 @@ function App() {
                           }))}
                         />
                       </td>
-                      <td>
+                      <td data-label="Son endeks">
                         <input
                           aria-label={`${number} numaralı dairenin son endeksi`}
-                          type="number"
-                          min="0"
-                          step="0.001"
-                          inputMode="decimal"
-                          placeholder="Endeks"
+                          type="text"
+                          inputMode="numeric"
                           disabled={access.role === 'accountant'}
                           value={reading.current}
                           onChange={(event) => setBulkReadings((readings) => ({
@@ -969,7 +1105,20 @@ function App() {
                           }))}
                         />
                       </td>
-                      {access.role !== 'concierge' && <td className="bulk-dues-value">{totalDue === null ? '—' : formatMoney(totalDue)}</td>}
+                      <td className="bulk-dues-value" data-label={`${monthNameLabel(month)} aidatı`}>
+                        {totalDue === null
+                          ? '—'
+                          : (
+                            <>
+                              <strong>{formatMoney(totalDue)}</strong>
+                              <small>
+                                {formatCubicMeters(consumptionLitres ?? 0)} × {formatMoney(Number(rate?.hotWater ?? 0))}
+                                {' + '}
+                                {formatMoney(Number(rate?.dues ?? 0))} aidat
+                              </small>
+                            </>
+                          )}
+                      </td>
                     </tr>
                   )
                 })}
@@ -977,26 +1126,28 @@ function App() {
             </table>
           </div>
           <div className="bulk-table-footer">
-            <span>{access.role === 'concierge' ? 'Yalnızca sayaç endeksleri düzenlenebilir.' : access.role === 'accountant' ? 'Görüntüleme yetkisi — kayıtlar değiştirilemez.' : 'Toplam borç = aidat + sıcak su. Paylaşım bağlantısını açan herkes sabit listeyi görebilir.'}</span>
-            {isManager && (
+            <span>{`Daire tipi seçildiği anda kaydedilir ve değiştirilene kadar her ay aynı kalır. Endeksleri girip kaydedin.${isManager ? ' Paylaşım bağlantısını açan herkes sabit listeyi görebilir.' : ''}`}</span>
+            {canSaveBulk && (
               <div className="bulk-footer-actions">
-                <button className="secondary-button" type="submit" disabled={savingRates || savingBulkApartments || savingShare}>
-                  {savingBulkApartments ? 'Kaydediliyor…' : 'Daire ve endeksleri kaydet'}
+                <button
+                  className={isManager ? 'secondary-button' : 'primary-button'}
+                  type="submit"
+                  disabled={savingRates || savingBulkApartments || savingShare}
+                >
+                  {savingBulkApartments ? 'Kaydediliyor…' : 'Endeksleri kaydet'}
                 </button>
-                <button className="primary-button" type="button" disabled={savingRates || savingBulkApartments || savingShare} onClick={() => void createShare()}>
-                  {savingShare ? 'Paylaşım hazırlanıyor…' : 'Listeyi paylaş'}
-                </button>
+                {isManager && (
+                  <button className="primary-button" type="button" disabled={savingRates || savingBulkApartments || savingShare} onClick={() => void createShare()}>
+                    {savingShare ? 'Paylaşım hazırlanıyor…' : 'Listeyi paylaş'}
+                  </button>
+                )}
               </div>
-            )}
-            {isConcierge && (
-              <button className="primary-button" type="submit" disabled={savingBulkApartments}>
-                {savingBulkApartments ? 'Endeksler kaydediliyor…' : 'Endeksleri kaydet'}
-              </button>
             )}
           </div>
         </form>
       </section>
-      {!isConcierge && <footer className="footer">Sayaç Takip <span>·</span> Aylık aidat ve sıcak su takibi</footer>}
+      )}
+      {isManager && <footer className="footer">Sayaç Takip <span>·</span> Aylık aidat ve sıcak su takibi</footer>}
     </main>
   )
 }

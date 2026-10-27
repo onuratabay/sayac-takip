@@ -521,20 +521,20 @@ button:disabled {
   font-weight: 650;
 }
 
-.bulk-apartment-table th:nth-child(1) {
+.bulk-apartment-table thead th:nth-child(1) {
   width: 11%;
 }
 
-.bulk-apartment-table th:nth-child(2) {
+.bulk-apartment-table thead th:nth-child(2) {
   width: 19%;
 }
 
-.bulk-apartment-table th:nth-child(3),
-.bulk-apartment-table th:nth-child(4) {
+.bulk-apartment-table thead th:nth-child(3),
+.bulk-apartment-table thead th:nth-child(4) {
   width: 20%;
 }
 
-.bulk-apartment-table th:nth-child(5) {
+.bulk-apartment-table thead th:nth-child(5) {
   width: 30%;
 }
 
@@ -551,6 +551,12 @@ button:disabled {
   border-bottom: 0;
 }
 
+.bulk-type-readonly {
+  color: #455449;
+  font-size: 11px;
+  font-weight: 600;
+}
+
 .bulk-dues-value {
   color: #315f3d;
   font-size: 11px;
@@ -558,12 +564,30 @@ button:disabled {
   white-space: nowrap;
 }
 
+.bulk-dues-value strong {
+  display: block;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.bulk-dues-value small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 500;
+}
+
 .bulk-table-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding-top: 13px;
+  padding: 13px 0 4px;
+  background: #fff;
 }
 
 .bulk-table-footer > span {
@@ -705,6 +729,101 @@ button:disabled {
 
   .bulk-footer-actions {
     flex-direction: column;
+  }
+
+  .bulk-table-footer {
+    border-top: 1px solid var(--line);
+  }
+
+  /* Each apartment row becomes a card on phones. */
+  .bulk-table-scroll {
+    max-height: none;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .bulk-apartment-table,
+  .bulk-apartment-table tbody {
+    display: block;
+    min-width: 0;
+  }
+
+  .bulk-apartment-table thead {
+    display: none;
+  }
+
+  .bulk-apartment-table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+    margin-bottom: 10px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #fff;
+  }
+
+  .bulk-apartment-table tbody th,
+  .bulk-apartment-table tbody td {
+    display: block;
+    width: auto;
+    padding: 0;
+    border: 0;
+  }
+
+  .bulk-apartment-table tbody th {
+    align-self: center;
+    color: var(--ink);
+    font-size: 15px;
+  }
+
+  .bulk-apartment-table tbody th::before {
+    content: 'Daire ';
+  }
+
+  .bulk-type-cell {
+    align-self: center;
+    text-align: right;
+  }
+
+  .bulk-apartment-table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 5px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  /* 16px keeps iOS Safari from zooming into the field on focus. */
+  .bulk-apartment-table select,
+  .bulk-apartment-table input {
+    height: 42px;
+    font-size: 16px;
+  }
+
+  .bulk-apartment-table td.bulk-dues-value {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: 1fr auto;
+    align-items: baseline;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+    white-space: normal;
+  }
+
+  .bulk-apartment-table td.bulk-dues-value::before {
+    margin-bottom: 0;
+  }
+
+  .bulk-dues-value strong {
+    font-size: 15px;
+  }
+
+  .bulk-dues-value small {
+    grid-column: 1 / -1;
+    font-size: 11px;
   }
 
   .share-shell {
