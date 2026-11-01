@@ -28,6 +28,24 @@ interface MeterReading {
 interface ReadingDraft {
   previous: string
   current: string
+  water: string
+  electricity: string
+}
+
+const emptyReadingDraft: ReadingDraft = { previous: '', current: '', water: '', electricity: '' }
+
+interface UtilityBill {
+  water_amount: number | null
+  electricity_amount: number | null
+}
+
+interface ApartmentBill extends UtilityBill {
+  apartment_id: string
+}
+
+interface BillDraft {
+  water: string
+  electricity: string
 }
 
 interface SharedDue {
@@ -110,6 +128,20 @@ function waterCost(litres: number, pricePerCubicMeter: number) {
   return Math.round((litres * Math.round(pricePerCubicMeter * 100)) / 1000) / 100
 }
 
+// Bill amounts are typed the Turkish way (1.250,50); 1250,50, 1250.50 and 1250 work too.
+// An empty field means "not entered" (null); text that is not an amount gives undefined.
+function parseAmount(value: string) {
+  const trimmed = value.trim()
+  if (trimmed === '') return null
+  if (/^\d{1,3}(\.\d{3})+(,\d{1,2})?$/.test(trimmed)) return Number(trimmed.replace(/\./g, '').replace(',', '.'))
+  if (/^\d+([.,]\d{1,2})?$/.test(trimmed)) return Number(trimmed.replace(',', '.'))
+  return undefined
+}
+
+function formatAmountInput(value: number | null | undefined) {
+  return value == null ? '' : Number(value).toFixed(2).replace('.', ',')
+}
+
 function formatMoney(value: number) {
   return new Intl.NumberFormat('tr-TR', {
     style: 'currency',
@@ -162,6 +194,11 @@ function App() {
   const [bulkReadings, setBulkReadings] = useState<Record<number, ReadingDraft>>({})
   const [previousReadings, setPreviousReadings] = useState<Record<string, number>>({})
   const [currentReadings, setCurrentReadings] = useState<Record<string, number>>({})
+  // Saved water + electricity bill total per apartment id, for apartments that have a bill row this month.
+  const [apartmentBillTotals, setApartmentBillTotals] = useState<Record<string, number>>({})
+  const [bills, setBills] = useState<BillDraft>({ water: '', electricity: '' })
+  const [savingBills, setSavingBills] = useState(false)
+  const [billsMessage, setBillsMessage] = useState<{ error: boolean; text: string } | null>(null)
   const [savingRates, setSavingRates] = useState(false)
   const [savingApartment, setSavingApartment] = useState(false)
   const [savingBulkApartments, setSavingBulkApartments] = useState(false)
@@ -324,19 +361,24 @@ function App() {
       }
 
       const previousMonth = shiftMonth(month, -1)
-      const [apartmentResult, rateResult, readingResult] = await Promise.all([
+      const [apartmentResult, rateResult, readingResult, billResult] = await Promise.all([
         supabase.from('apartments').select('id, unit_number, apartment_type').order('unit_number'),
         supabase.from('monthly_rates').select('apartment_type, dues, hot_water_price')
           .lte('rate_month', monthDate(month)).order('rate_month', { ascending: false }),
         supabase.from('meter_readings').select('apartment_id, reading_month, index_value')
           .gte('reading_month', monthDate(previousMonth))
           .lte('reading_month', monthDate(month)),
+        supabase.from('apartment_bills').select('apartment_id, water_amount, electricity_amount')
+          .eq('bill_month', monthDate(month)),
       ])
 
       if (apartmentResult.error) throw apartmentResult.error
       if (rateResult.error) throw rateResult.error
       if (readingResult.error) throw readingResult.error
+      if (billResult.error) throw billResult.error
       if (requestId !== dataRequestId.current) return
+
+      const billsByApartment = new Map((billResult.data as ApartmentBill[]).map((bill) => [bill.apartment_id, bill] as const))
 
       const nextApartments = apartmentResult.data as Apartment[]
       const nextRates = emptyRates()
@@ -365,9 +407,12 @@ function App() {
       for (const apartment of nextApartments) {
         const previousIndex = previous[apartment.id]
         const currentIndex = current[apartment.id]
+        const bill = billsByApartment.get(apartment.id)
         readingsByApartment.set(apartment.unit_number, {
           previous: previousIndex === undefined ? '' : formatIndex(Number(previousIndex)),
           current: currentIndex === undefined ? '' : formatIndex(Number(currentIndex)),
+          water: formatAmountInput(bill?.water_amount),
+          electricity: formatAmountInput(bill?.electricity_amount),
         })
       }
 
@@ -375,9 +420,13 @@ function App() {
       setRates(nextRates)
       setPreviousReadings(previous)
       setCurrentReadings(current)
+      setApartmentBillTotals(Object.fromEntries(Array.from(billsByApartment, ([apartmentId, bill]) => [
+        apartmentId,
+        Number(bill.water_amount ?? 0) + Number(bill.electricity_amount ?? 0),
+      ])))
       setBulkReadings(Object.fromEntries(Array.from({ length: 46 }, (_, index) => {
         const number = index + 1
-        return [number, readingsByApartment.get(String(number)) ?? { previous: '', current: '' }]
+        return [number, readingsByApartment.get(String(number)) ?? emptyReadingDraft]
       })))
       setError('')
     } catch (loadError) {
@@ -392,6 +441,33 @@ function App() {
     // oxlint-disable-next-line react/set-state-in-effect
     void loadData()
   }, [loadData])
+
+  // Bills load on their own so that saving the meter readings never overwrites unsaved bill amounts.
+  useEffect(() => {
+    if (!supabase || !session || !access || access.role === 'accountant') return
+    let active = true
+    Promise.resolve(supabase.from('utility_bills').select('water_amount, electricity_amount')
+      .eq('bill_month', monthDate(month)).maybeSingle())
+      .then(({ data, error: billError }) => {
+        if (!active) return
+        if (billError) {
+          setBillsMessage({ error: true, text: `Faturalar yüklenemedi: ${billError.message}` })
+          return
+        }
+        const bill = data as UtilityBill | null
+        setBills({
+          water: formatAmountInput(bill?.water_amount),
+          electricity: formatAmountInput(bill?.electricity_amount),
+        })
+      })
+      .catch((billError: unknown) => {
+        if (!active) return
+        setBillsMessage({ error: true, text: `Faturalar yüklenemedi: ${errorMessage(billError)}` })
+      })
+    return () => {
+      active = false
+    }
+  }, [access, month, session])
 
   async function handleAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -467,6 +543,8 @@ function App() {
     if (!value) return
     setError('')
     setNotice('')
+    setBills({ water: '', electricity: '' })
+    setBillsMessage(null)
     setMonth(value)
   }
 
@@ -570,20 +648,26 @@ function App() {
       return {
         number,
         apartmentId: apartmentIds.get(String(number)),
-        readings: bulkReadings[number] ?? { previous: '', current: '' },
+        readings: bulkReadings[number] ?? emptyReadingDraft,
       }
     })
 
     for (const row of rows) {
-      const { previous, current } = row.readings
+      const { previous, current, water, electricity } = row.readings
       const hasPrevious = previous.trim() !== ''
       const hasCurrent = current.trim() !== ''
-      if (!allowIncomplete && hasPrevious !== hasCurrent) {
-        setError(`${row.number} numaralı daire için önceki ve son endeks birlikte girilmelidir.`)
+      const hasBills = water.trim() !== '' || electricity.trim() !== ''
+      // A row with only last month's index has nothing new to save yet, so it must not block the others.
+      if (!allowIncomplete && hasCurrent && !hasPrevious) {
+        setError(`${row.number} numaralı daire için önceki endeksi de girin.`)
         return false
       }
-      if ((hasPrevious || hasCurrent) && !row.apartmentId) {
+      if ((hasPrevious || hasCurrent || hasBills) && !row.apartmentId) {
         setError(`${row.number} numaralı daire için önce daire tipini seçin.`)
+        return false
+      }
+      if (parseAmount(water) === undefined || parseAmount(electricity) === undefined) {
+        setError(`${row.number} numaralı dairede fatura tutarlarını 1250, 1250,50 veya 1.250,50 biçiminde girin.`)
         return false
       }
       if (hasPrevious && hasCurrent) {
@@ -621,11 +705,34 @@ function App() {
         if (readingsError) throw readingsError
       }
 
-      setNotice(meterRows.length > 0 ? 'Girilen sayaç endeksleri kaydedildi.' : 'Kaydedilecek endeks girilmedi.')
+      const billRows = rows.flatMap(({ apartmentId, readings: { water, electricity } }) => {
+        const waterAmount = parseAmount(water) ?? null
+        const electricityAmount = parseAmount(electricity) ?? null
+        if (!apartmentId) return []
+        // Saved rows are rewritten even when emptied, so clearing a field removes the amount.
+        if (waterAmount === null && electricityAmount === null && !(apartmentId in apartmentBillTotals)) return []
+        return [{
+          apartment_id: apartmentId,
+          owner_id: access.owner_id,
+          bill_month: monthDate(month),
+          water_amount: waterAmount,
+          electricity_amount: electricityAmount,
+        }]
+      })
+
+      if (billRows.length > 0) {
+        const { error: billsError } = await supabase.from('apartment_bills')
+          .upsert(billRows, { onConflict: 'apartment_id,bill_month' })
+        if (billsError) throw billsError
+      }
+
+      setNotice(meterRows.length > 0 || billRows.length > 0
+        ? 'Girilen endeks ve fatura bilgileri kaydedildi.'
+        : 'Kaydedilecek endeks veya fatura girilmedi.')
       await loadData()
       return true
     } catch (bulkError) {
-      setError(`Endeksler kaydedilemedi: ${errorMessage(bulkError)}`)
+      setError(`Endeks ve faturalar kaydedilemedi: ${errorMessage(bulkError)}`)
       return false
     } finally {
       setSavingBulkApartments(false)
@@ -637,6 +744,34 @@ function App() {
     await saveBulkApartments()
   }
 
+  async function saveBills(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!supabase || !access || !canSaveBulk) return
+    const water = parseAmount(bills.water)
+    const electricity = parseAmount(bills.electricity)
+    if (water === undefined || electricity === undefined) {
+      setBillsMessage({ error: true, text: 'Tutarları 1250, 1250,50 veya 1.250,50 biçiminde girin.' })
+      return
+    }
+    setSavingBills(true)
+    setBillsMessage(null)
+    try {
+      const { error: saveError } = await supabase.from('utility_bills').upsert({
+        owner_id: access.owner_id,
+        bill_month: monthDate(month),
+        water_amount: water,
+        electricity_amount: electricity,
+      }, { onConflict: 'owner_id,bill_month' })
+      if (saveError) throw saveError
+      setBills({ water: formatAmountInput(water), electricity: formatAmountInput(electricity) })
+      setBillsMessage({ error: false, text: `${monthLabel(month)} faturaları kaydedildi.` })
+    } catch (saveError) {
+      setBillsMessage({ error: true, text: `Faturalar kaydedilemedi: ${errorMessage(saveError)}` })
+    } finally {
+      setSavingBills(false)
+    }
+  }
+
   async function createShare() {
     if (!supabase || !isManager) return
     const shareRows = Array.from({ length: 46 }, (_, index) => {
@@ -645,7 +780,7 @@ function App() {
       return {
         number,
         apartmentType: existing?.apartment_type ?? '',
-        reading: bulkReadings[number] ?? { previous: '', current: '' },
+        reading: bulkReadings[number] ?? emptyReadingDraft,
       }
     })
     const incompleteApartments = shareRows.filter(({ apartmentType, reading }) => (
@@ -714,10 +849,11 @@ function App() {
     const rate = rates[apartment.apartment_type]
     result.consumptionLitres += consumptionLitres
     result.amount += Number(rate.dues) + waterCost(consumptionLitres, Number(rate.hotWater))
+      + (apartmentBillTotals[apartment.id] ?? 0)
     result.complete += 1
     return result
   }, { consumptionLitres: 0, amount: 0, complete: 0 }), [
-    apartments, currentReadings, previousReadings, rates,
+    apartmentBillTotals, apartments, currentReadings, previousReadings, rates,
   ])
 
   if (shareId) {
@@ -872,7 +1008,7 @@ function App() {
           <SummaryCard label="Kayıtlı daire" value={String(apartments.length)} detail="Tüm daireler" />
           <SummaryCard label="Endeksi tamamlanan" value={`${totals.complete} / ${apartments.length}`} detail={monthLabel(month)} />
           <SummaryCard label="Toplam sıcak su" value={formatCubicMeters(totals.consumptionLitres)} detail="Tamamlanan daireler" />
-          <SummaryCard label="Tahmini toplam" value={formatMoney(totals.amount)} detail="Aidat + sıcak su" />
+          <SummaryCard label="Tahmini toplam" value={formatMoney(totals.amount)} detail="Aidat + sıcak su + faturalar" />
         </section>
       )}
 
@@ -974,7 +1110,7 @@ function App() {
                             >
                               <option value="">Rol atanmamış</option>
                               <option value="accountant">Muhasebeci — yalnızca aidat listesi</option>
-                              <option value="concierge">Apartman görevlisi — endeks girişi</option>
+                              <option value="concierge">Apartman görevlisi — endeks ve fatura girişi</option>
                             </select>
                           )}
                       </td>
@@ -1035,6 +1171,30 @@ function App() {
             )
             : <span className="panel-caption">Endeksleri bu ay için girin · Tüketim farkı otomatik hesaplanır</span>}
         </div>
+        <form className="utility-bills" onSubmit={saveBills}>
+          <div className="utility-bills-heading">
+            <span className="eyebrow">ELEKTRİK VE SU</span>
+            <h3>{monthLabel(month)} bina faturaları</h3>
+          </div>
+          <label>Su faturası
+            <span className="money-input">
+              <span>₺</span>
+              <input type="text" inputMode="decimal" placeholder="0,00" disabled={!canSaveBulk} value={bills.water} onChange={(event) => { setBills((oldBills) => ({ ...oldBills, water: event.target.value })); setBillsMessage(null) }} />
+            </span>
+          </label>
+          <label>Elektrik faturası
+            <span className="money-input">
+              <span>₺</span>
+              <input type="text" inputMode="decimal" placeholder="0,00" disabled={!canSaveBulk} value={bills.electricity} onChange={(event) => { setBills((oldBills) => ({ ...oldBills, electricity: event.target.value })); setBillsMessage(null) }} />
+            </span>
+          </label>
+          {canSaveBulk && <button className="primary-button" disabled={savingBills}>{savingBills ? 'Kaydediliyor…' : 'Faturaları kaydet'}</button>}
+          {billsMessage && (
+            <p className={billsMessage.error ? 'utility-bills-message is-error' : 'utility-bills-message'} role={billsMessage.error ? 'alert' : 'status'}>
+              {billsMessage.text}
+            </p>
+          )}
+        </form>
         <form className="bulk-apartment-form" onSubmit={addBulkApartments}>
           <div className="bulk-table-scroll">
             <table className="bulk-apartment-table">
@@ -1044,6 +1204,8 @@ function App() {
                   <th scope="col">Daire tipi</th>
                   <th scope="col">Önceki endeks</th>
                   <th scope="col">Son endeks</th>
+                  <th scope="col">Su faturası</th>
+                  <th scope="col">Elektrik faturası</th>
                   <th scope="col">{monthNameLabel(month)} aidatı</th>
                 </tr>
               </thead>
@@ -1052,7 +1214,7 @@ function App() {
                   const number = index + 1
                   const existingApartment = apartments.find((apartment) => apartment.unit_number === String(number))
                   const selectedType = existingApartment?.apartment_type ?? ''
-                  const reading = bulkReadings[number] ?? { previous: '', current: '' }
+                  const reading = bulkReadings[number] ?? emptyReadingDraft
                   const rate = selectedType ? rates[selectedType as ApartmentType] : null
                   const previousLitres = parseIndexLitres(reading.previous)
                   const currentLitres = parseIndexLitres(reading.current)
@@ -1060,7 +1222,12 @@ function App() {
                     ? currentLitres - previousLitres
                     : null
                   const water = rate && consumptionLitres !== null ? waterCost(consumptionLitres, Number(rate.hotWater)) : null
-                  const totalDue = rate && water !== null ? Number(rate.dues) + water : null
+                  const waterBill = parseAmount(reading.water)
+                  const electricityBill = parseAmount(reading.electricity)
+                  const billsTotal = waterBill === undefined || electricityBill === undefined
+                    ? null
+                    : (waterBill ?? 0) + (electricityBill ?? 0)
+                  const totalDue = rate && water !== null && billsTotal !== null ? Number(rate.dues) + water + billsTotal : null
                   return (
                     <tr key={number}>
                       <th scope="row">{number}</th>
@@ -1105,6 +1272,34 @@ function App() {
                           }))}
                         />
                       </td>
+                      <td data-label="Su faturası">
+                        <input
+                          aria-label={`${number} numaralı dairenin su faturası`}
+                          type="text"
+                          inputMode="decimal"
+                          placeholder="₺"
+                          disabled={access.role === 'accountant'}
+                          value={reading.water}
+                          onChange={(event) => setBulkReadings((readings) => ({
+                            ...readings,
+                            [number]: { ...reading, water: event.target.value },
+                          }))}
+                        />
+                      </td>
+                      <td data-label="Elektrik faturası">
+                        <input
+                          aria-label={`${number} numaralı dairenin elektrik faturası`}
+                          type="text"
+                          inputMode="decimal"
+                          placeholder="₺"
+                          disabled={access.role === 'accountant'}
+                          value={reading.electricity}
+                          onChange={(event) => setBulkReadings((readings) => ({
+                            ...readings,
+                            [number]: { ...reading, electricity: event.target.value },
+                          }))}
+                        />
+                      </td>
                       <td className="bulk-dues-value" data-label={`${monthNameLabel(month)} aidatı`}>
                         {totalDue === null
                           ? '—'
@@ -1116,6 +1311,11 @@ function App() {
                                 {' + '}
                                 {formatMoney(Number(rate?.dues ?? 0))} aidat
                               </small>
+                              {billsTotal !== null && billsTotal > 0 && (
+                                <small>
+                                  + {formatMoney(waterBill ?? 0)} su + {formatMoney(electricityBill ?? 0)} elektrik faturası
+                                </small>
+                              )}
                             </>
                           )}
                       </td>
@@ -1126,7 +1326,10 @@ function App() {
             </table>
           </div>
           <div className="bulk-table-footer">
-            <span>{`Daire tipi seçildiği anda kaydedilir ve değiştirilene kadar her ay aynı kalır. Endeksleri girip kaydedin.${isManager ? ' Paylaşım bağlantısını açan herkes sabit listeyi görebilir.' : ''}`}</span>
+            {/* The latest result is repeated here because the alert at the top is out of view while working in the table. */}
+            {error || notice
+              ? <span className={error ? 'bulk-footer-message is-error' : 'bulk-footer-message'}>{error || notice}</span>
+              : <span>{`Daire tipi seçildiği anda kaydedilir ve değiştirilene kadar her ay aynı kalır. Endeksleri ve faturaları girip kaydedin.${isManager ? ' Paylaşım bağlantısını açan herkes sabit listeyi görebilir.' : ''}`}</span>}
             {canSaveBulk && (
               <div className="bulk-footer-actions">
                 <button
@@ -1134,7 +1337,7 @@ function App() {
                   type="submit"
                   disabled={savingRates || savingBulkApartments || savingShare}
                 >
-                  {savingBulkApartments ? 'Kaydediliyor…' : 'Endeksleri kaydet'}
+                  {savingBulkApartments ? 'Kaydediliyor…' : 'Endeks ve faturaları kaydet'}
                 </button>
                 {isManager && (
                   <button className="primary-button" type="button" disabled={savingRates || savingBulkApartments || savingShare} onClick={() => void createShare()}>

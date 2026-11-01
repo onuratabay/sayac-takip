@@ -482,6 +482,67 @@ button:disabled {
   width: 100%;
 }
 
+.utility-bills {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(2, minmax(150px, 220px)) auto;
+  align-items: end;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid #edf0ed;
+  border-radius: 8px;
+  background: #f8faf8;
+}
+
+.utility-bills-heading {
+  align-self: center;
+  color: #7d8a80;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.utility-bills h3 {
+  margin: 5px 0 0;
+  color: var(--ink);
+  font-size: 14px;
+  letter-spacing: -0.3px;
+}
+
+.utility-bills label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  color: #59665c;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.utility-bills .money-input {
+  height: 39px;
+  background: #fff;
+}
+
+.utility-bills .money-input input {
+  height: 37px;
+  font-size: 12px;
+}
+
+.utility-bills .primary-button {
+  min-height: 39px;
+}
+
+.utility-bills-message {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #34704a;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.utility-bills-message.is-error {
+  color: #953e36;
+}
+
 .bulk-table-scroll {
   max-height: 570px;
   overflow-y: auto;
@@ -491,7 +552,7 @@ button:disabled {
 
 .bulk-apartment-table {
   width: 100%;
-  min-width: 780px;
+  min-width: 960px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -515,27 +576,32 @@ button:disabled {
 }
 
 .bulk-apartment-table tbody th {
-  width: 11%;
+  width: 7%;
   color: #455449;
   font-size: 11px;
   font-weight: 650;
 }
 
 .bulk-apartment-table thead th:nth-child(1) {
-  width: 11%;
+  width: 7%;
 }
 
 .bulk-apartment-table thead th:nth-child(2) {
-  width: 19%;
+  width: 13%;
 }
 
 .bulk-apartment-table thead th:nth-child(3),
 .bulk-apartment-table thead th:nth-child(4) {
-  width: 20%;
+  width: 14%;
 }
 
-.bulk-apartment-table thead th:nth-child(5) {
-  width: 30%;
+.bulk-apartment-table thead th:nth-child(5),
+.bulk-apartment-table thead th:nth-child(6) {
+  width: 13%;
+}
+
+.bulk-apartment-table thead th:nth-child(7) {
+  width: 26%;
 }
 
 .bulk-apartment-table select,
@@ -595,6 +661,16 @@ button:disabled {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.5;
+}
+
+.bulk-table-footer > .bulk-footer-message {
+  color: #34704a;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.bulk-table-footer > .bulk-footer-message.is-error {
+  color: #953e36;
 }
 
 .bulk-footer-actions {
@@ -733,6 +809,28 @@ button:disabled {
 
   .bulk-table-footer {
     border-top: 1px solid var(--line);
+  }
+
+  .utility-bills {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .utility-bills-heading {
+    grid-column: 1 / -1;
+  }
+
+  .utility-bills .money-input {
+    height: 44px;
+  }
+
+  .utility-bills .money-input input {
+    height: 42px;
+    font-size: 16px;
+  }
+
+  .utility-bills .primary-button {
+    grid-column: 1 / -1;
+    min-height: 44px;
   }
 
   /* Each apartment row becomes a card on phones. */

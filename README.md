@@ -14,8 +14,10 @@ React, TypeScript, Vite ve Supabase kullanılarak geliştirilen sayaç takip uyg
 8. Daire tipinin seçildiği anda kaydedilmesi ve apartman görevlisinin de daire tipini değiştirebilmesi için `supabase/migrations/202610240007_set_apartment_type.sql` dosyasını çalıştırın.
 9. Daire tipi kontrol kurallarını 1+0, 1+1, 2+1 ve 3+1 olarak sabitlemek için `supabase/migrations/202610240008_fix_apartment_type_constraints.sql` dosyasını çalıştırın. Bu dosya tekrar çalıştırılabilir; `002` migration'ı atlanmış kurulumlarda kalan eski `1+2`/`1+3` kayıtlarını da dönüştürür.
 10. Muhasebecinin yalnızca daire numaralarını ve aylık aidat tutarlarını görebilmesi için `supabase/migrations/202610240009_accountant_dues_only.sql` dosyasını çalıştırın. Bu işlem daire tipi, endeks ve fiyat tablolarının okunmasını yönetici ve apartman görevlisiyle sınırlar.
-11. Supabase **Project Settings → API** bölümünden proje URL'sini ve public anon/publishable anahtarını alın.
-12. Ortam dosyasını hazırlayın:
+11. Apartman görevlisinin ve yöneticinin endeks ekranında binanın aylık su ve elektrik faturası tutarlarını girebilmesi için `supabase/migrations/202611010010_utility_bills.sql` dosyasını çalıştırın. Faturaları muhasebeci göremez.
+12. Her dairenin aylık su ve elektrik faturasını 1–46 tablosuna girebilmek ve bu tutarları dairenin aylık aidatına eklemek için `supabase/migrations/202611010011_apartment_bills.sql` dosyasını çalıştırın. Bu işlem muhasebeci ekranındaki ve paylaşılan listedeki aidat hesabını da günceller.
+13. Supabase **Project Settings → API** bölümünden proje URL'sini ve public anon/publishable anahtarını alın.
+14. Ortam dosyasını hazırlayın:
 
 ```bash
 npm install
@@ -60,18 +62,19 @@ echo "sdk.dir=/opt/homebrew/share/android-commandlinetools" > android/local.prop
 npm run apk
 ```
 
-JDK 21 farklı bir konumdaysa `JAVA_HOME_21` ortam değişkeniyle belirtin. Üretilen APK debug anahtarıyla imzalıdır; telefona doğrudan kurulabilir ancak Play Store'a yüklenemez. Koddaki her değişiklikten sonra APK'yı `npm run apk` ile yeniden derleyin.
+JDK 21 farklı bir konumdaysa `JAVA_HOME_21` ortam değişkeniyle belirtin. Üretilen APK debug anahtarıyla imzalıdır; telefona doğrudan kurulabilir ancak Play Store'a yüklenemez.
 
-APK içinde uygulama `https://localhost` adresinden çalışır. Bu nedenle **Listeyi paylaş** ile üretilen bağlantı ve şifre sıfırlama e-postasındaki dönüş bağlantısı, uygulama ayrıca herkese açık bir web adresinde yayınlanmadıkça çalışmaz.
+Android uygulaması web uygulamasının kopyasını taşımaz; açıldığında `https://sayac-takip.onuratabay.com` adresindeki web uygulamasını yükler (`capacitor.config.ts` → `server.url`). Böylece web ve Android her zaman aynı sürümü çalıştırır: web sitesi güncellendiğinde uygulama da bir sonraki açılışta güncellenir. APK'yı yalnızca `capacitor.config.ts` veya `android/` klasörü değiştiğinde `npm run apk` ile yeniden derleyin. İnternet bağlantısı yoksa uygulama `public/offline.html` sayfasını gösterir. **Listeyi paylaş** bağlantıları ve şifre sıfırlama dönüş bağlantısı da bu web adresini kullanır.
 
 ## Kullanım
 
 - Daire numarası ve 1+0, 1+1, 2+1 veya 3+1 tipini seçerek daire ekleyin.
-- Tam genişlikteki 1–46 daire tablosunda daire tipini seçin; tip seçildiği anda kaydedilir ve değiştirilene kadar sonraki aylarda da aynı kalır. Önceki endeksi ve seçili ayın son endeksini sayaçta okunduğu gibi girin; son 3 hane litredir (ör. `123456` = 123.456 m³; `123.456` ve `123,456` da kabul edilir). Örneğin `123456` → `123999` 543 litre, yani 0.543 m³ tüketimdir. **Endeksleri kaydet** ile saklayın. Ay sütunu (ör. "Ekim aidatı") `(son endeks − önceki endeks) × m³ birim fiyatı + aylık aidat` toplamını gösterir.
+- Tam genişlikteki 1–46 daire tablosunda daire tipini seçin; tip seçildiği anda kaydedilir ve değiştirilene kadar sonraki aylarda da aynı kalır. Önceki endeksi ve seçili ayın son endeksini sayaçta okunduğu gibi girin; son 3 hane litredir (ör. `123456` = 123.456 m³; `123.456` ve `123,456` da kabul edilir). Örneğin `123456` → `123999` 543 litre, yani 0.543 m³ tüketimdir. Aynı satırdaki **Su faturası** ve **Elektrik faturası** alanlarına dairenin o ayki fatura tutarlarını `1250`, `1250,50` veya `1.250,50` biçiminde girin. **Endeks ve faturaları kaydet** ile saklayın. Ay sütunu (ör. "Ekim aidatı") `(son endeks − önceki endeks) × m³ birim fiyatı + aylık aidat + su faturası + elektrik faturası` toplamını gösterir; muhasebeci ekranı ve paylaşılan liste de aynı toplamı kullanır.
 - Seçili ay için daire tipine göre aylık aidat ve sıcak su m³ birim fiyatını girip kaydedin. Yeni bir ayda fiyat alanları son kaydedilen değerlerle başlar; ay için kaydedilen fiyat geçmişteki tutarları değiştirmez.
-- Önceki ve seçili ay endeksleri aylık kayıt olarak saklanır; tüketim farkı ile aidat + sıcak su toplamı otomatik hesaplanır.
+- Önceki ve seçili ay endeksleri aylık kayıt olarak saklanır; tüketim farkı ile aidat + sıcak su + fatura toplamı otomatik hesaplanır. Son endeksi henüz girilmemiş, yalnızca önceki endeksi dolu satırlar kaydı engellemez; girilen satırlar kaydedilir.
+- Endeks tablosunun üstündeki **Elektrik ve su** bölümüne binanın kendi (ortak) su ve elektrik faturası tutarlarını `1250`, `1250,50` veya `1.250,50` biçiminde girip **Faturaları kaydet** ile saklayın. Faturalar endekslerden bağımsız kaydedilir; eksik endeksler fatura kaydını engellemez. Boş bırakılan fatura "girilmedi" olarak saklanır; bina faturaları aidat hesabını değiştirmez.
 - İlk girişte önceki ay endeksi de istenir. Sonraki dönemlerde kayıtlı endeks önceki değer olarak yüklenir.
 - **Listeyi paylaş** fiyatları ve girilmiş endeksleri önce kaydeder, sonra yeni sekmede değişmeyen bir paylaşım anlık görüntüsü açar. Eksik tip veya endeks bilgisi olan daireler uyarıda listelenir ve paylaşımın dışında bırakılır. Paylaşım URL'sine sahip herkes daire numarası ve borç tutarlarını görüntüleyebilir; bu bağlantıyı yalnızca paylaşmak istediğiniz kişilerle iletin.
-- Yönetici tüm verileri ve ekip rollerini yönetebilir. Apartman görevlisi daire tipini seçebilir ve önceki ve son sayaç endekslerini girebilir; muhasebeci yalnızca seçtiği dönem için daire numaralarını ve aidat tutarlarını görebilir, hiçbir kaydı değiştiremez. Bu kısıtlamalar Supabase RLS ile de uygulanır.
+- Yönetici tüm verileri ve ekip rollerini yönetebilir. Apartman görevlisi daire tipini seçebilir, önceki ve son sayaç endekslerini, dairelerin ve binanın aylık su ve elektrik faturalarını girebilir; muhasebeci yalnızca seçtiği dönem için daire numaralarını ve aidat tutarlarını görebilir, hiçbir kaydı değiştiremez. Bu kısıtlamalar Supabase RLS ile de uygulanır.
 
 Supabase istemcisi `src/lib/supabase.ts` içindedir. Tarayıcıya yalnızca public anon/publishable anahtarını koyun; `service_role` anahtarını istemciye eklemeyin.
